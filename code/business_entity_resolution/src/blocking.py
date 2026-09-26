@@ -26,6 +26,16 @@ def _pairs(xs):
     return pl.concat_list(out).list.drop_nulls()
 
 
+def _skeleton(e: pl.Expr) -> pl.Expr:
+    """Sorted 3-letter consonant stems of each token (vowels/h dropped after the first letter)."""
+    for a, b in (("ght", "t"), ("ph", "f"), ("c", "k"), ("q", "k"), ("x", "ks"), ("z", "j"), ("w", "v")):
+        e = e.str.replace_all(a, b, literal=True)
+    e = e.str.replace_all(r"([bcdfgjklmnpqrstvxz])h", "$1").str.replace_all(r"\B[aeiouyh]+", "")
+    for ch in "bdfgjklmnprstv":
+        e = e.str.replace_all(ch + ch, ch, literal=True)
+    return e.str.split(" ").list.eval(pl.element().str.slice(0, 3)).list.sort().list.join(" ")
+
+
 def _key_exprs():
     """key name -> (list-valued expression, max S1 per key value, max targets per key value).
 
@@ -42,6 +52,7 @@ def _key_exprs():
     ns7 = pl.when(pl.col("name_ns").str.len_chars() >= 6).then(pl.col("name_ns").str.slice(0, 7))
     # asymmetric: S1 side always emits, target side only when its address is empty
     no_addr = (pl.col("addr_core").str.len_chars() < 3) | (pl.col("side") == 0)
+    skel = pl.when(pl.col("name_core") != "").then(_skeleton(pl.col("name_core")))
     one = lambda e: pl.concat_list([e]).list.drop_nulls()  # noqa: E731
     return {
         "core": (one(core), 30, 300),
@@ -59,6 +70,10 @@ def _key_exprs():
         "anum": (_combos(at, nums, "#"), 15, 150),
         "aa": (_pairs(at), 15, 150),
         "nn": (_pairs(nt), 15, 150),
+        # consonant skeleton of the name: transliteration-robust ("brait knsaltensi" ~ "bright consultancy")
+        "skel": (one(skel), 15, 150),
+        "skel_num": (one(skel + "#" + num), 15, 150),
+        "skel_a": (_combos([skel], at[:2], "@"), 15, 150),
     }
 
 

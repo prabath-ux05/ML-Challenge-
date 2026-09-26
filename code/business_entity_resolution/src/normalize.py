@@ -80,6 +80,10 @@ NAME_CANON = {
     "distribution": "dist", "distributing": "dist", "distributors": "dist",
     "foods": "food", "food": "food",
     "automobiles": "auto", "automotive": "auto", "auto": "auto",
+    # French noise words seen appended to names in the test data ("Et Fils", "& Associes", "Freres")
+    "fils": "sons", "sons": "sons", "freres": "bros", "frs": "bros",
+    "associes": "assoc", "associe": "assoc",
+    "etablissements": "ets", "etablissement": "ets", "ets": "ets",
 }
 
 # Legal-form / generic tokens removed to build the "core" name.
@@ -90,6 +94,8 @@ LEGAL_TOKENS = {
     "du", "des", "l", "d", "et", "soc", "assn",
     # honorifics / prefixes seen in the data ("M/s ABC Traders", "Mr RKK Products", "Sri ...")
     "ms", "mr", "mrs", "sri", "shri", "shree", "smt", "null",
+    # generic French suffix noise ("Pole (France) Societe", "SARL Adn Anciens")
+    "france",
 }
 
 # Multi-word phrases collapsed before tokenising.
@@ -213,6 +219,15 @@ IN_STATES = {
     "uttar pradesh": "up", "uttarakhand": "uk", "uttaranchal": "uk", "west bengal": "wb",
     "delhi": "dl", "new delhi": "dl", "jammu and kashmir": "jk", "puducherry": "py",
     "chandigarh": "ch", "ladakh": "la",
+    # state names as they come out of unidecode on native script (seen in the data)
+    "mharastr": "mh", "maharastr": "mh", "mhrastr": "mh", "dili": "dl", "krnatk": "ka", "karnatak": "ka",
+    "tmilnatu": "tn", "tamilnatu": "tn", "tmilnadu": "tn", "pshcimbng": "wb", "pashcimbang": "wb",
+    "pscimbng": "wb", "gujrat": "gj", "gujraat": "gj", "telngan": "tg", "telangan": "tg", "hriyana": "hr",
+    "hariyana": "hr", "rajsthan": "rj", "rajasthn": "rj", "keralam": "kl", "kerln": "kl", "keral": "kl",
+    "pnjab": "pb", "panjab": "pb", "uttar prdesh": "up", "utr prdesh": "up", "madhy prdesh": "mp",
+    "madhya prdesh": "mp", "andhrprdesh": "ap", "andhr prdesh": "ap", "andhra prdesh": "ap",
+    "himachl prdesh": "hp", "himachal prdesh": "hp", "odisa": "od", "urisa": "od", "jharkhnd": "jh",
+    "chatisgadh": "cg", "chhatisgarh": "cg", "uttrakhnd": "uk", "uttarakhnd": "uk", "asam": "as",
 }
 _STATE_PATTERNS = sorted({**US_STATES, **IN_STATES}.items(), key=lambda kv: -len(kv[0]))
 _STATE_RE = re.compile(r"\b(" + "|".join(re.escape(k) for k, _ in _STATE_PATTERNS) + r")\b")
@@ -227,13 +242,37 @@ _WS = re.compile(r"\s+")
 _DIGITS = re.compile(r"\d+")
 _POSTAL6 = re.compile(r"(?<!\d)(\d{3})\s?(\d{3})(?!\d)")
 _POSTAL5 = re.compile(r"(?<!\d)(\d{5})(?:-\d{4})?(?!\d)")
-_DBA_RE = re.compile(r"\b(?:d\s*/?\s*b\s*/?\s*a|doing business as|t\s*/\s*a|trading as|aka|a\s*/\s*k\s*/\s*a)\b", re.I)
-# French region names that can be dropped for matching (they're administrative, not address-specific)
-_FR_REGIONS = {
-    "ile de france", "nouvelle aquitaine", "auvergne rhone alpes", "occitanie",
-    "hauts de france", "grand est", "provence alpes cote d azur", "pays de la loire",
-    "bretagne", "normandie", "bourgogne franche comte", "centre val de loire",
-    "corse",
+_DBA_RE = re.compile(r"\b(?:d\s*/?\s*b\s*/?\s*a|doing business as|t\s*/\s*a|trading as|aka|a\s*/\s*k\s*/\s*a"
+                     r"|formerly|previously|anciennement|f\s*/\s*k\s*/\s*a|fka)\b", re.I)
+# French regions and their departments -> one region code, so "Lille, Hauts-de-France" and
+# "Lille, Nord" agree (like US/Indian states -> codes). Static table, no external lookup.
+FR_REGIONS = {
+    "ara": ["Auvergne-Rhône-Alpes", "Ain", "Allier", "Ardèche", "Cantal", "Drôme", "Isère", "Loire",
+            "Haute-Loire", "Puy-de-Dôme", "Rhône", "Savoie", "Haute-Savoie"],
+    "bfc": ["Bourgogne-Franche-Comté", "Côte-d'Or", "Doubs", "Jura", "Nièvre", "Haute-Saône", "Saône-et-Loire",
+            "Yonne", "Territoire de Belfort"],
+    "bre": ["Bretagne", "Côtes-d'Armor", "Finistère", "Ille-et-Vilaine", "Morbihan"],
+    "cvl": ["Centre-Val de Loire", "Cher", "Eure-et-Loir", "Indre", "Indre-et-Loire", "Loir-et-Cher", "Loiret"],
+    "cor": ["Corse", "Corse-du-Sud", "Haute-Corse"],
+    "ges": ["Grand Est", "Ardennes", "Aube", "Marne", "Haute-Marne", "Meurthe-et-Moselle", "Meuse", "Moselle",
+            "Bas-Rhin", "Haut-Rhin", "Vosges"],
+    "hdf": ["Hauts-de-France", "Aisne", "Nord", "Oise", "Pas-de-Calais", "Somme"],
+    "idf": ["Île-de-France", "Seine-et-Marne", "Yvelines", "Essonne", "Hauts-de-Seine", "Seine-Saint-Denis",
+            "Val-de-Marne", "Val-d'Oise"],  # "Paris" deliberately kept as a city
+    "nor": ["Normandie", "Calvados", "Eure", "Manche", "Orne", "Seine-Maritime"],
+    "naq": ["Nouvelle-Aquitaine", "Charente", "Charente-Maritime", "Corrèze", "Creuse", "Dordogne", "Gironde",
+            "Landes", "Lot-et-Garonne", "Pyrénées-Atlantiques", "Deux-Sèvres", "Vienne", "Haute-Vienne"],
+    "occ": ["Occitanie", "Ariège", "Aude", "Aveyron", "Gard", "Haute-Garonne", "Gers", "Hérault", "Lot", "Lozère",
+            "Hautes-Pyrénées", "Pyrénées-Orientales", "Tarn", "Tarn-et-Garonne"],
+    "pdl": ["Pays de la Loire", "Loire-Atlantique", "Maine-et-Loire", "Mayenne", "Sarthe", "Vendée"],
+    "pac": ["Provence-Alpes-Côte d'Azur", "Alpes-de-Haute-Provence", "Hautes-Alpes", "Alpes-Maritimes",
+            "Bouches-du-Rhône", "Var", "Vaucluse"],
+}
+# French address words (applied only to French records, on top of ADDR_CANON)
+FR_ADDR_CANON = {
+    "ndeg": "no", "n": "no", "appartement": "apt", "appt": "apt", "app": "apt", "batiment": "bldg",
+    "bat": "bldg", "cours": "crs", "passage": "psg", "pass": "psg", "q": "qu", "residence": "res",
+    "etage": "fl", "eme": "", "er": "", "cedex": "",
 }
 
 
@@ -275,6 +314,14 @@ def _split_alnum(s: str) -> str:
     # "12b" -> "12 b", "no12" -> "no 12" : unify municipal numbering formats.
     s = re.sub(r"(\d)([a-z])", r"\1 \2", s)
     return re.sub(r"([a-z])(\d)", r"\1 \2", s)
+
+
+def _fr_key(name: str) -> str:
+    return _basic(unidecode(name).lower().replace(".", " "))
+
+
+_FR_MAP = {_fr_key(n): code for code, names in FR_REGIONS.items() for n in names}
+_FR_RE = re.compile(r"\b(" + "|".join(re.escape(k) for k in sorted(_FR_MAP, key=len, reverse=True)) + r")\b")
 
 
 @lru_cache(maxsize=1 << 16)
@@ -355,29 +402,32 @@ def norm_address(raw: str, country: str = "") -> dict:
     postal = pins[-1] if pins else (zips[-1] if zips else "")
 
     def canon(text: str) -> str:
+        fr = _is_fr(country)
         t = _basic(text.replace(".", " "))
-        t = _STATE_RE.sub(lambda m: _STATE_MAP[m.group(1)], t)
+        if fr:
+            t = _FR_RE.sub(lambda m: _FR_MAP[m.group(1)], t)
+        else:
+            t = _STATE_RE.sub(lambda m: _STATE_MAP[m.group(1)], t)
         t = _split_alnum(t)
         toks = []
-        fr = _is_fr(country)
         for tok in t.split():
             if fr and tok == "st":
                 toks.append("st")  # saint
                 continue
+            if fr and tok in FR_ADDR_CANON:
+                tok = FR_ADDR_CANON[tok]
+                if not tok:
+                    continue
             if tok in ("null", "none", "nan", "na"):
                 continue
+            if tok.isdigit():  # zero-padded house numbers: "003380" -> "3380", "c00139" -> "c 139"
+                tok = tok.lstrip("0") or "0"
             tok = ADDR_CANON.get(tok, tok)
             toks.append(CITY_CANON.get(tok, tok))
         return " ".join(toks)
 
     full = canon(s0)
     core = canon(no_lm)
-    # strip French region names from core (they are administrative, not address-specific)
-    if _is_fr(country):
-        core_low = core
-        for reg in _FR_REGIONS:
-            core_low = core_low.replace(reg, " ")
-        core = _WS.sub(" ", core_low).strip()
     core_np = _POSTAL5.sub(" ", _POSTAL6.sub(" ", core)) if postal else core
     nums = _DIGITS.findall(core_np)
     return {

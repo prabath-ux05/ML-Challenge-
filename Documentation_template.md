@@ -1,105 +1,167 @@
-# Methodology — Business Entity Resolution
+# ML Challenge 2026: Business Entity Resolution Solution Template
 
-> Draft. Copy these sections into the official `Documentation_template.md` headings and replace every `TODO` with numbers from `models/cv_report.json` and the training log from the real data.
+**Team Name:** Mesh Minds
+**Team Members:** TODO (list all team members)
+**Submission Date:** TODO
 
-## 1. Methodology overview
-We treat the task as **pairwise classification over a blocked candidate set, followed by a set-level decision that maximises macro-F0.5**:
+---
 
-1. **Normalise** every record, whether Source 1, 2 or 3, into canonical name and address representations.
-2. **Block**: union 7 cheap retrieval passes, then cap each Source 1 entity's list to about 60 candidates.
-3. **Stage-1 matcher**: a gradient-boosted classifier over 61 pair features.
-4. **Stage-2 matcher**: the same model family, with context features added from stage-1 out-of-fold probabilities. These include competition between Source 1 entities for a target, the margin to the runner-up, and coherence among a Source 1 entity's matches.
-5. **Decision**: a one-to-one constraint (each Source 2 or 3 record belongs to at most one Source 1 entity), then a threshold or expected-F0.5 subset selection. Whichever does better on out-of-fold macro-F0.5 is used.
+## 1. Executive Summary
+Our pipeline scales to the full data: 2.2M Source 1 records against 10.3M Source 2/3 records on one laptop. Its stages are:
+1. Transliteration-aware normalisation.
+2. Hash-join blocking on 18 multi-valued keys.
+3. **Cluster expansion**, which recovers matches blocking missed by using an entity's confident matches as extra queries.
+4. A two-stage gradient-boosted matcher. Stage 2 adds context features: competition between entities for a record, and coherence among an entity's matches.
+5. A decision layer that directly maximises expected per-entity F0.5 under a one-to-one constraint.
 
-Validation is 5-fold **GroupKFold by Source 1 entity**, so no entity's pairs leak across folds. Every decision parameter is tuned on out-of-fold predictions with the exact competition metric, singletons included.
+The approach is entirely data-driven. It uses no external data, APIs or pretrained models.
 
-## 2. Candidate generation / blocking
-TF-IDF spaces are fitted on all records of a split, using no labels:
-- character 2–4-grams of the core name
-- character 2–3-grams of the phonetic core name
-- word tokens of the core name
-- character 2–4-grams of the core address
-- word tokens of the address
-- word tokens of name plus address
+---
 
-| pass | description | k |
-|---|---|---|
-| name char TF-IDF | top-k per Source 1 entity, within country | 25 |
-| phonetic name TF-IDF | handles transliteration and typos | 15 |
-| address char TF-IDF | catches renamed or DBA businesses at the same address | 10 |
-| name+address word TF-IDF | | 25 |
-| reverse passes | each Source 2/3 record's top Source 1 entities (name, and name+address) | 3 + 3 |
-| global name pass | ignores country, so noisy or open-set country labels are safe | 5 |
-| postal code + first name token | exact key block | — |
+## 2. Methodology
 
-The union is capped at 60 per Source 1 entity using a cheap blended cosine. Reverse-best pairs are always kept. Country is used only to partition the search. An unseen label such as France gets searched within its own partition, and a label with no counterpart in the target sources falls back to searching everything. Nothing is hard-coded to {US, India}.
+### 2.1 Problem Analysis
+- **Scale:**
+  - train: 2,206,821 Source 1 records, 10,320,219 Source 2/3 records, 7,638,365 true links
+  - test: 1,732,544 Source 1 records, 9,969,589 Source 2/3 records, including 259k French entities with no French training data
+- **Link structure:**
+  - Each Source 1 entity has 0–11 matches (mean about 3.5); 5.6% have none.
+  - No Source 2/3 record is linked to more than one Source 1 entity, which justifies a one-to-one constraint.
+- **Name noise:**
+  - legal-suffix variants (Pvt/Private, Ltd/Limited, LLC/L.L.C.)
+  - word reordering
+  - typos, and OCR confusions like `PRlVATE` and `Fa1con`
+  - DBA/"trading as" prefixes
+  - web handles and domains (`gulfbrc.com`, `@casillasconcord`)
+  - honorifics (`M/s`, `Mr`, `Sri`)
+  - names **fully in native Indic scripts**: about 1M train records across Devanagari, Kannada, Tamil, Bengali, Gujarati and Odia
+  - pseudonymous trade names with no overlap with the legal name (`Nylakelo`)
+- **Address noise:**
+  - abbreviations (St/Street, Rd/Road, Rly, Crsg)
+  - components reordered, dropped or duplicated
+  - landmarks (`Near SBI ATM`, `Opp.`)
+  - municipal number formats (`509-511`, `#10433`, `C00139`)
+  - transliterated state names (`पश्चिमबंग` → `pshcimbng`)
+  - legacy city names (Bombay, Calcutta, Gurgaon)
+  - about 3% of target records have **no address at all**
+- **Ambiguity:**
+  - The name vocabulary is small, so many different entities share a name ("Gold Food", "Green Properties", chain stores).
+  - The name alone is often not identifying, and the address is decisive.
 
-- Blocking recall ceiling on train: **TODO** (synthetic: 0.9997)
-- Oracle macro-F0.5 given the candidates: **TODO**
-- Average candidates per Source 1 entity: **TODO** (reduction ratio **TODO**)
+### 2.2 Solution Strategy
+**Approach Type:** Hybrid. Blocking, a pairwise GBDT classifier, graph-style cluster expansion and a set-level decision.
 
-## 3. Feature engineering (61 pair + 13 context features)
-- **Normalisation**:
-  - Unicode→ASCII.
-  - Canonical abbreviations: Corp/Corporation, Pvt/Private, Ltd/Limited, St/Street, Rd/Road, Bd/Boulevard, R./Rue, and others.
-  - `&`→and; US and Indian state names mapped to their codes; renamed Indian cities (Bombay→Mumbai, and others).
-  - Legal forms stripped to make a *core name*: LLC, Inc, Pvt Ltd, SARL, SAS, and others.
-  - DBA, "trading as" and bracketed alias splitting.
-  - Landmark clauses separated out ("Near SBI ATM", "Opp.").
-  - 5- and 6-digit postal codes parsed, including "560 001"; "12B" split into "12 B".
-  - A phonetic key for transliteration: sh/s, ee/i, w/v, doubled letters.
-- **Name features**:
-  - TF-IDF cosines.
-  - Levenshtein, ratio, partial ratio, token sort and token set.
-  - Jaro-Winkler.
-  - Phonetic ratios.
-  - Ratio with spaces removed.
-  - Best match over DBA variants.
-  - Token Jaccard and containment.
-  - First-token match.
-  - Acronym match.
-  - Legal-form conflict.
-  - Lengths.
-- **Address features**:
-  - Cosines and fuzzy ratios on the address without landmarks.
-  - Postal code equal, postal 3-digit prefix equal, postal missing.
-  - House number equal, number-set Jaccard, disjoint numbers.
-  - Landmark present.
-  - Containment.
-- **Chain and generic-name handling**: how often the core name occurs in each pool. A frequent name like a chain store forces the model to rely on the address.
-- **Candidate-set context**: rank and gap to the best cosine within the Source 1 entity's candidates and within the target's competing Source 1 entities.
-- **Stage-2 context from stage-1 out-of-fold probabilities**:
-  - rank within the Source 1 entity and within the target
-  - max and sum
-  - count above 0.5
-  - margin to the best competitor on both sides
-  - coherence: max similarity of a candidate to the Source 1 entity's top-3 confident matches, weighted by probability
+**Core Innovations:**
+1. **Cross-rank rare-token blocking.** Every record emits all combinations of its rarest name and address tokens and house numbers, so a typo that changes which token is "rarest" still links.
+2. **Cluster expansion** from confident matches, which lifts candidate recall.
+3. **Context and coherence features** in stage 2.
+4. **Expected-F0.5 subset selection** per entity, which treats the empty prediction as a first-class option for singletons.
 
-The model sees no country identity, so it transfers to France. Country is used only for `same_country` and for the French abbreviation table.
+---
 
-## 4. Model architecture
-scikit-learn `HistGradientBoostingClassifier` (BSD-3):
-- learning rate 0.05, up to 800 iterations with early stopping
-- 48 leaves, min leaf 30, L2 1.0
+## 3. Candidate Generation (Blocking)
+- **Normalisation:**
+  - Unicode→ASCII transliteration, with Indic clean-up (collapse doubled letters, map transliterated legal words back to pvt/ltd).
+  - Canonical abbreviation tables for names and addresses, including French forms (SARL/SAS, Bd, R., Av).
+  - US and Indian state codes, including transliterated variants; legacy→current city names.
+  - Landmark clauses stripped from the core address; house number and postal code parsing; a phonetic key.
+- **Blocking keys used** (all within country; the country label is an open set, so France forms its own blocks):
+  - exact core name, phonetic name and **consonant skeleton** (transliteration-robust: `bright consultancy` ≈ `brait knsaltensi` → `brt kns`), with and without the house number
+  - name-prefix × address token
+  - the 2 rarest name tokens × the 3 rarest address tokens
+  - rare tokens × house numbers
+  - rare address-token pairs and rare name-token pairs
+  - name-only keys reserved for targets with no address
 
-Five fold models are trained per stage, and test predictions average all five. There are no pretrained or external models, so the parameter count is far below 8B and the license is permissive.
+  Each key value is capped by block size, and per entity the 30 candidates with the highest specificity-weighted key evidence are kept (Σ 1/log2(1+|block|)).
+- **Cluster expansion.**
+  - For each confident stage-1 match (i, u), targets sharing a small block (≤30 records) with u are collected.
+  - A target t is kept when it is a near-duplicate of u: name or address token-set similarity ≥ 85.
+  - (i, t) is added with sibling-evidence features, up to 10 per entity.
+- **Candidate pairs generated:** TODO train / TODO test
+- **How we ensured true matches were not lost:**
+  - We measured blocking recall and the oracle macro-F0.5 on train at every iteration.
+  - Recall went from 90.6% (single keys) to 95.7% (cross-rank keys), then 96.2% (skeleton keys and state transliteration), then TODO with expansion.
+  - Each miss category (native script, no address, shortened address) was analysed and targeted.
 
-## 5. Decision layer (precision-first)
-- **One-to-one**: a Source 2 or 3 record is linked only to the Source 1 entity that scores highest for it. The ground truth has no record linked to two Source 1 entities, and the rule removes duplicate-branch false merges.
-- **Threshold mode**: link when p ≥ t, with t tuned on out-of-fold macro-F0.5.
-- **Expected-F0.5 mode**: per Source 1 entity, choose the prefix of sorted candidates that maximises expected F0.5. The empty set is also considered, scored at P(no match) = ∏(1−p). This handles singletons explicitly.
-- The best mode and parameters on out-of-fold data are saved with the model.
+---
 
-## 6. Results
-| setting | macro-F0.5 |
-|---|---|
-| stage-1 OOF (train) | TODO |
-| stage-2 OOF (train) | TODO |
-| singletons / matched entities | TODO / TODO |
-| per country: US / India | TODO / TODO |
-| public leaderboard | TODO |
+## 4. Matching Model
 
-## 7. Other notes
-- **Fair play**: no external data, APIs, geocoding or internet lookups. TF-IDF is fitted on the unlabeled test records only, which is standard transductive preprocessing.
-- **Reproducibility**: fixed seeds, pinned `requirements.txt`, and a single command (`pipeline.py run`).
-- **Runtime**: about 90 s end to end for 4.6k Source 1 records and 9.4k targets on a laptop CPU. Runtime grows linearly with the number of candidates.
+**Features used** (about 118):
+- Name features:
+  - rapidfuzz ratio, partial ratio, token-sort, token-set, Jaro-Winkler and normalised Levenshtein on the core name
+  - phonetic-key ratios; no-space ratios (web handles)
+  - best DBA-variant similarity; exact core, full and phonetic equality
+  - token Jaccard and containment; **IDF-weighted** overlap
+  - max IDF of shared and unshared tokens; acronym match; legal-form conflict
+  - native-script flag; name frequency (chain indicator)
+- Address features:
+  - fuzzy ratios on the core (landmark-free) and full address; token Jaccard and containment
+  - IDF-weighted overlap
+  - postal code equal, missing or prefix match; house-number equality, containment and number-set Jaccard
+  - landmark and empty-address flags
+- Other:
+  - which blocking keys fired, and their specificity score
+  - rank and gap of the pair within its entity's candidates and within the target's competing entities
+- Stage-2 context, computed from out-of-fold stage-1 probabilities:
+  - rank, max and sum per entity and per target
+  - margin to the best competing entity or record
+  - **coherence**: similarity to the entity's top-3 confident matches, weighted by probability
+  - sibling evidence from expansion
+
+**Model type:**
+- scikit-learn `HistGradientBoostingClassifier` (BSD-3), in 2 stages × 4 folds.
+- Folds are grouped by Source 1 entity, and every training pair gets an out-of-fold score.
+- Models are fit on 25% of entities, with negatives down-sampled to 35% and re-weighted. Test scores average the fold models.
+
+**Threshold selection method:**
+- Grid search on held-out entities (never used for fitting) with the exact macro-F0.5 metric, including singletons.
+- Candidates: a global threshold, and per-entity **expected-F0.5 maximisation**, which picks the prefix of sorted candidates maximising E[F0.5] and predicts empty when P(no match) is higher.
+- Both are tried with and without the one-to-one constraint, where a record goes only to its best entity.
+
+---
+
+## 5. Results & Error Analysis
+
+| run | blocking recall | oracle F0.5 | stage-1 F0.5 | stage-2 F0.5 |
+|---|---|---|---|---|
+| baseline (single-rank keys, 10% sample) | 95.7% | 0.9838 | 0.9604 | **0.9629** |
+| v2 (skeleton keys, state transliteration, IDF and coherence features, 25% sample) | 96.2% | 0.9861 | TODO | TODO |
+| v3 (+ cluster expansion) | TODO | TODO | TODO | TODO |
+
+- Baseline by country: US 0.9769, India 0.9415; singletons 0.9527.
+- **Common false positives (wrong merges):** TODO from `error_analysis.py`
+- **Common false negatives (missed matches):**
+  - native-script names with shortened addresses
+  - address-less records with typo'd names
+  - pseudonymous trade names whose address was also altered
+
+---
+
+## 6. Conclusion
+TODO
+
+---
+
+## Appendix
+
+### A. Code Artefacts
+`code/business_entity_resolution/`:
+- `src/normalize.py`: text normalisation
+- `src/prep.py`: parallel, cached normalisation
+- `src/blocking.py`: key blocking
+- `src/expand.py`: cluster expansion
+- `src/features.py`: pair, group and context features
+- `src/pipeline.py`: entry point for training, OOF, decision tuning and prediction
+- `src/error_analysis.py`: error analysis
+- `src/evaluate.py`: macro-F0.5 scorer
+
+Reproduce the outputs with one command:
+```
+python code/business_entity_resolution/src/pipeline.py run --data-dir dataset --work-dir work --out-dir output
+```
+This writes `output/matching_results.tsv` and `output/candidate_pairs.tsv`. See the README for runtimes and flags.
+
+### B. Additional Results
+TODO

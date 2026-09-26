@@ -56,8 +56,9 @@ def load_split(data_dir: str, split: str, cache_dir: str, workers: int):
         if os.path.exists(cp):
             out.append(pl.read_parquet(cp))
             continue
-        raw = pl.concat([read_source(os.path.join(data_dir, split, f"{split}_source{k}.tsv")) for k in srcs])
-        df = normalise(raw, workers)
+        # one source file at a time keeps peak memory at ~half of the concatenated size
+        df = pl.concat([normalise(read_source(os.path.join(data_dir, split, f"{split}_source{k}.tsv")), workers)
+                        for k in srcs])
         df.write_parquet(cp)
         out.append(df)
     return out[0], out[1]

@@ -16,3 +16,5 @@ output/
 
 # Pipeline cache (normalised data, candidates, features, models)
 work/
+output_v*/
+output_diag/
