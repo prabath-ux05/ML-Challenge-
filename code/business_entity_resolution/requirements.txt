@@ -6,6 +6,7 @@ polars==1.44.2
 pyarrow==25.0.1
 scipy==1.18.1
 scikit-learn==1.9.1
+lightgbm==4.7.0  # needs libomp on macOS: brew install libomp (falls back to sklearn if unavailable)
 rapidfuzz==3.14.6
 Unidecode==1.4.0
 joblib==1.6.0

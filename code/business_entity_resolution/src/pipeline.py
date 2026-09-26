@@ -269,7 +269,7 @@ class LGBModel:
 
     def __init__(self, seed):
         self.seed = seed
-        self.params = dict(objective="binary", learning_rate=0.05, num_leaves=127, min_data_in_leaf=50,
+        self.params = dict(objective="binary", learning_rate=0.08, num_leaves=127, min_data_in_leaf=50,
                            feature_fraction=0.85, bagging_fraction=0.8, bagging_freq=1, lambda_l2=5.0,
                            max_bin=255, verbose=-1, seed=seed, num_threads=os.cpu_count() or 4)
 
@@ -287,6 +287,36 @@ class LGBModel:
     def predict_proba(self, X):
         p = self.booster.predict(X, num_iteration=self.booster.best_iteration)
         return np.c_[1 - p, p]
+
+
+class _Booster:
+    """Wraps a trained lgb.Booster with the predict_proba interface used by predict_oof/predict_avg."""
+
+    def __init__(self, booster):
+        self.booster, self.n_iter_ = booster, booster.best_iteration
+
+    def predict_proba(self, X):
+        p = self.booster.predict(X, num_iteration=self.booster.best_iteration)
+        return np.c_[1 - p, p]
+
+
+def _fit_lgb_folds(X, y, w, fold, K, seed):
+    base = lgb.Dataset(X, y, weight=w, params={"max_bin": 255, "verbose": -1}, free_raw_data=True).construct()
+    rng = np.random.default_rng(seed)
+    va_all = rng.random(len(y)) < 0.06  # early-stopping hold-out, disjoint from each fold's training rows
+    prm = LGBModel(seed).params
+    models = []
+    for k in range(K):
+        tr = np.where((fold != k) & ~va_all)[0]
+        va = np.where((fold != k) & va_all)[0]
+        dtr, dva = base.subset(tr), base.subset(va)
+        b = lgb.train({**prm, "seed": seed + k}, dtr, num_boost_round=3000, valid_sets=[dva],
+                      callbacks=[lgb.early_stopping(100, verbose=False, min_delta=2e-5)])
+        models.append(_Booster(b))
+        log(f"  fold {k}: {b.best_iteration} iters")
+        del dtr, dva
+        gc.collect()
+    return models
 
 
 def make_model(seed, kind="auto"):
@@ -317,6 +347,11 @@ def fit_oof(parts, gpath, extra, y, fold, train_rows, K, seed, cols=None):
     ys, fs, ws = y[use], fold[use], train_rows[use]
     log(f"  training rows {n} x {len(cols)} features, positives {ys.mean():.3f}, "
         f"model={'lightgbm' if HAVE_LGB else 'sklearn-hgb'}")
+    if HAVE_LGB:  # bin once, then slice folds from the binned data (raw matrix freed immediately)
+        models = _fit_lgb_folds(X, ys, ws, fs, K, seed)
+        del X
+        gc.collect()
+        return predict_oof(models, parts, gpath, extra, cols, fold), models, cols
     models = []
     for k in range(K):
         tr = fs != k
@@ -588,7 +623,7 @@ def main():
     ap.add_argument("--norm-dir", default=None, help="normalised-record cache (default: <work-dir>/norm)")
     ap.add_argument("--out-dir", default="output")
     ap.add_argument("--folds", type=int, default=4)
-    ap.add_argument("--sample", type=float, default=0.25, help="fraction of S1 entities used to fit models")
+    ap.add_argument("--sample", type=float, default=0.3, help="fraction of S1 entities used to fit models")
     ap.add_argument("--neg-keep", type=float, default=0.25, help="share of easy negative pairs kept for fitting")
     ap.add_argument("--eval-s1", type=int, default=300_000, help="held-out S1 used to tune the decision")
     ap.add_argument("--s1-frac", type=float, default=1.0, help="fast experiments: use this share of train S1")
