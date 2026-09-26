@@ -246,7 +246,9 @@ def singleton_model(ij: pl.DataFrame, p: np.ndarray, truth: pl.DataFrame | None,
         models = []
         fk = fold_s1[ii]
         for k in range(K):
-            m = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.1, random_state=k).fit(X[fk != k], y[fk != k])
+            m = (make_model(k) if HAVE_LGB else
+                 HistGradientBoostingClassifier(max_iter=300, learning_rate=0.1, random_state=k))
+            m.fit(X[fk != k], y[fk != k])
             q[fk == k] = m.predict_proba(X[fk == k])[:, 1]
             models.append(m)
     else:
@@ -457,6 +459,27 @@ def load_data(a, split):
     return s1, tg
 
 
+def stratified_group_folds(s1: pl.DataFrame, truth: pl.DataFrame, K: int) -> np.ndarray:
+    """Fold per S1 entity (the group): entities are shuffled by a stable hash and dealt round-robin
+    within each stratum (country x has-any-match), so every fold has the same country mix and
+    singleton rate. All candidate pairs of an entity share its fold -> no entity leakage."""
+    has = np.zeros(s1.height, bool)
+    has[truth["i"].unique().to_numpy()] = True
+    d = (s1.select("country", h=pl.col("id").hash(seed=7)).with_row_index("i")
+         .with_columns(has=pl.Series(has))
+         .sort("country", "has", "h")
+         .with_columns(fold=(pl.col("i").cum_count().over("country", "has") % K).cast(pl.Int8))
+         .sort("i"))
+    return d["fold"].to_numpy()
+
+
+def append_experiment(work: str, record: dict):
+    """One JSON line per training run -> the experiment log for the methodology document."""
+    rec = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), **record}
+    with open(os.path.join(work, "experiments.jsonl"), "a") as f:
+        f.write(json.dumps(rec, default=str) + "\n")
+
+
 def read_cols(parts, cols):
     return pl.concat([pl.read_parquet(p, columns=cols) for p in parts]) if parts else pl.DataFrame()
 
@@ -479,7 +502,7 @@ def cmd_train(a):
     log("features ready")
 
     h = s1.select(pl.col("id").hash(seed=7)).to_series().to_numpy()
-    fold_s1 = (h % a.folds).astype(np.int8)
+    fold_s1 = stratified_group_folds(s1, truth, a.folds)
     fit_ok = np.ones(s1.height, bool)
     if a.fit_countries:  # unseen-country proxy: fit only on these countries, score everything OOF
         fit_ok = s1["country"].is_in(a.fit_countries).to_numpy()
@@ -551,11 +574,21 @@ def cmd_train(a):
     use_sm = stage == "stage2"
     pred = decide(cand_u, oof2 if stage == "stage2" else p1_u, res[stage]["params"], seg_u,
                   has_oof if use_sm else None)
+    by_country = {}
     for c in sorted(s1["country"].unique()):
         ids = pl.Series(np.where(s1["country"].to_numpy() == c)[0].astype(np.uint32))
-        log(f"  country={c!r}: F0.5={macro_f05(pred, truth, ids):.4f}")
+        by_country[c] = macro_f05(pred, truth, ids)
+        log(f"  country={c!r}: F0.5={by_country[c]:.4f}")
     sing = pl.Series(np.setdiff1d(np.arange(s1.height), truth["i"].unique().to_numpy()).astype(np.uint32))
-    log(f"  singletons F0.5={macro_f05(pred, truth, sing):.4f} (n={len(sing)})")
+    f_sing = macro_f05(pred, truth, sing)
+    log(f"  singletons F0.5={f_sing:.4f} (n={len(sing)})")
+    append_experiment(work, dict(
+        feature_version=FEATURE_VERSION, model="lightgbm" if HAVE_LGB else "sklearn-hgb", folds=a.folds,
+        sample=a.sample, neg_keep=a.neg_keep, s1_frac=a.s1_frac, fit_countries=a.fit_countries,
+        block_cfg=a.block_cfg, exp_cfg=a.exp_cfg, n_s1=s1.height, n_cand=cand.height, n_union=cand_u.height,
+        recall_blocking=blocking_recall(cand, truth), recall_union=blocking_recall(cand_u, truth),
+        oof_stage1=res["stage1"]["f05"], oof_stage2=res["stage2"]["f05"], chosen=stage,
+        params=res[stage]["params"], by_country=by_country, singletons=f_sing))
 
     joblib.dump(dict(m1=m1, m2=m2, cols1=cols1, cols2=cols2, stage=stage, params=res[stage]["params"],
                      sm=sm if use_sm else None, block_cfg=a.block_cfg, exp_cfg=a.exp_cfg),
@@ -622,7 +655,7 @@ def main():
     ap.add_argument("--work-dir", default="work", help="cache for normalised data, candidates, features, model")
     ap.add_argument("--norm-dir", default=None, help="normalised-record cache (default: <work-dir>/norm)")
     ap.add_argument("--out-dir", default="output")
-    ap.add_argument("--folds", type=int, default=4)
+    ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--sample", type=float, default=0.3, help="fraction of S1 entities used to fit models")
     ap.add_argument("--neg-keep", type=float, default=0.25, help="share of easy negative pairs kept for fitting")
     ap.add_argument("--eval-s1", type=int, default=300_000, help="held-out S1 used to tune the decision")
