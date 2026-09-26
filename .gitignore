@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Competition data (do not redistribute)
+dataset/
+
+# Generated artifacts
+models/
+output/
+*.zip
+
+# OS
+.DS_Store
