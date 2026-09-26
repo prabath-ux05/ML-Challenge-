@@ -1,146 +1,152 @@
-"""Record preparation + multi-pass blocking (candidate generation)."""
-import numpy as np
-import pandas as pd
-import scipy.sparse as sp
-from sklearn.feature_extraction.text import TfidfVectorizer
+"""Key-based blocking that scales to 10M+ records (hash joins in polars).
 
-from normalize import (acronym, canon_country, core_name, name_variants, norm_address, norm_name,
-                       phonetic)
+Every key is prefixed with the country label, so an unseen label (e.g. France) simply forms
+its own blocks. Rare-token keys only use tokens that appear at least twice in the split
+(a token seen once cannot link anything), which makes typo'd tokens fall through to other keys.
+"""
+import polars as pl
 
-SOURCE_COLS = ["entity_id", "business_name", "business_address", "country"]
-
-
-def load_source(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, quoting=3)
-    missing = [c for c in SOURCE_COLS if c not in df.columns]
-    if missing:
-        raise ValueError(f"{path}: missing columns {missing}")
-    return df[SOURCE_COLS]
+N_RARE = 3  # rarest tokens kept per record, per field
 
 
-def prepare(df: pd.DataFrame) -> pd.DataFrame:
-    out = pd.DataFrame({"id": df["entity_id"].str.strip().values})
-    out["src"] = out["id"].str[:2]
-    out["country"] = [canon_country(c) for c in df["country"]]
-    out["name_raw"] = df["business_name"].values
-    out["name_n"] = [norm_name(n) for n in df["business_name"]]
-    out["name_vars"] = [name_variants(n) for n in df["business_name"]]
-    out["name_core"] = [core_name(n) for n in out["name_n"]]
-    out["name_ph"] = [" ".join(phonetic(t) for t in c.split()) for c in out["name_core"]]
-    out["name_acr"] = [acronym(c) for c in out["name_core"]]
-    addrs = [norm_address(a, c) for a, c in zip(df["business_address"], out["country"])]
-    for k in ("full", "core", "landmark", "postal", "nums", "first_num"):
-        out["addr_" + k] = [a[k] for a in addrs]
-    out["all_text"] = out["name_core"] + " " + out["addr_core"]
-    return out
+def _combos(xs, ys, sep):
+    """All x+sep+y combinations as a list column (nulls dropped)."""
+    return pl.concat_list([pl.when(x.is_not_null() & y.is_not_null()).then(x + sep + y)
+                           for x in xs for y in ys]).list.drop_nulls()
 
 
-class Vectors:
-    """TF-IDF spaces fitted transductively on all records of a split (no labels used)."""
+def _pairs(xs):
+    """All order-independent pairs within xs as a list column."""
+    out = []
+    for a in range(len(xs)):
+        for b in range(a + 1, len(xs)):
+            x, y = xs[a], xs[b]
+            out.append(pl.when(x.is_not_null() & y.is_not_null()).then(
+                pl.min_horizontal(x, y) + " " + pl.max_horizontal(x, y)))
+    return pl.concat_list(out).list.drop_nulls()
 
-    SPACES = {
-        "name_char": ("name_core", dict(analyzer="char_wb", ngram_range=(2, 4), sublinear_tf=True, min_df=1)),
-        "name_ph": ("name_ph", dict(analyzer="char_wb", ngram_range=(2, 3), sublinear_tf=True)),
-        "name_word": ("name_core", dict(analyzer="word", token_pattern=r"\S+", sublinear_tf=True)),
-        "addr_char": ("addr_core", dict(analyzer="char_wb", ngram_range=(2, 4), sublinear_tf=True)),
-        "addr_word": ("addr_core", dict(analyzer="word", token_pattern=r"\S+", sublinear_tf=True)),
-        "all_word": ("all_text", dict(analyzer="word", token_pattern=r"\S+", sublinear_tf=True)),
+
+def _key_exprs():
+    """key name -> (list-valued expression, max S1 per key value, max targets per key value).
+
+    Keys are multi-valued so that e.g. a shared (name token, address token) links two records
+    even when typos change which tokens are the rarest on either side (cross-rank matching).
+    """
+    nt = [pl.col(f"nt_{k}") for k in range(1, N_RARE + 1)]
+    at = [pl.col(f"at_{k}") for k in range(1, N_RARE + 1)]
+    nums = [pl.col("nums").str.split(" ").list.get(k, null_on_oob=True) for k in range(3)]
+    nums = [pl.when(n != "").then(n) for n in nums]
+    num = pl.when(pl.col("first_num") != "").then(pl.col("first_num"))
+    core = pl.when(pl.col("name_core") != "").then(pl.col("name_core"))
+    ph = pl.when(pl.col("name_ph") != "").then(pl.col("name_ph").str.split(" ").list.sort().list.join(" "))
+    ns7 = pl.when(pl.col("name_ns").str.len_chars() >= 6).then(pl.col("name_ns").str.slice(0, 7))
+    # asymmetric: S1 side always emits, target side only when its address is empty
+    no_addr = (pl.col("addr_core").str.len_chars() < 3) | (pl.col("side") == 0)
+    one = lambda e: pl.concat_list([e]).list.drop_nulls()  # noqa: E731
+    return {
+        "core": (one(core), 30, 300),
+        "ph": (one(ph), 30, 300),
+        "core_noaddr": (one(pl.when(no_addr).then(core)), 200, 200),
+        "ph_noaddr": (one(pl.when(no_addr).then(ph)), 200, 200),
+        "ntok_noaddr": (pl.when(no_addr).then(pl.concat_list(nt).list.drop_nulls()), 50, 200),
+        "core_num": (one(core + "#" + num), 15, 150),
+        "ph_num": (one(ph + "#" + num), 15, 150),
+        "ns7_a": (_combos([ns7], at[:2], "@"), 15, 150),
+        "ns7_num": (one(ns7 + "#" + num), 15, 150),
+        "core_a": (_combos([core], at[:2], "@"), 30, 300),
+        "na": (_combos(nt[:2], at, "@"), 15, 150),
+        "nnum": (_combos(nt[:2], nums, "#"), 15, 150),
+        "anum": (_combos(at, nums, "#"), 15, 150),
+        "aa": (_pairs(at), 15, 150),
+        "nn": (_pairs(nt), 15, 150),
     }
 
-    def __init__(self, s1: pd.DataFrame, tg: pd.DataFrame):
-        self.m1, self.mt = {}, {}
-        for key, (col, kw) in self.SPACES.items():
-            v = TfidfVectorizer(dtype=np.float32, **kw)
-            v.fit(pd.concat([s1[col], tg[col]]).values)
-            self.m1[key] = v.transform(s1[col].values).tocsr()
-            self.mt[key] = v.transform(tg[col].values).tocsr()
 
-    def pair_cos(self, key, i, j, chunk=200_000):
-        a, b = self.m1[key], self.mt[key]
-        out = np.empty(len(i), dtype=np.float32)
-        for s in range(0, len(i), chunk):
-            e = s + chunk
-            out[s:e] = np.asarray(a[i[s:e]].multiply(b[j[s:e]]).sum(1)).ravel()
-        return out
+KEY_CAPS = {k: (c1, ct) for k, (_, c1, ct) in _key_exprs().items()}
+DEFAULT_BLOCKING = dict(max_per_s1=30)
 
 
-def _topk(A, B, k, a_idx, b_idx, budget=4e7):
-    """Top-k cosine neighbours in B for every row of A (both L2-normalised sparse)."""
-    if len(a_idx) == 0 or len(b_idx) == 0:
-        return np.empty(0, int), np.empty(0, int), np.empty(0, np.float32)
-    A, Bt = A[a_idx], B[b_idx].T.tocsc()
-    k = min(k, len(b_idx))
-    step = max(1, int(budget // max(len(b_idx), 1)))
-    ri, ci, sc = [], [], []
-    for s in range(0, len(a_idx), step):
-        S = (A[s:s + step] @ Bt).toarray()
-        top = np.argpartition(-S, k - 1, axis=1)[:, :k] if k < S.shape[1] else np.tile(np.arange(S.shape[1]), (S.shape[0], 1))
-        vals = np.take_along_axis(S, top, 1)
-        keep = vals > 0
-        rows = np.repeat(np.arange(s, s + S.shape[0]), top.shape[1]).reshape(top.shape)
-        ri.append(a_idx[rows[keep]]); ci.append(b_idx[top[keep]]); sc.append(vals[keep])
-    return np.concatenate(ri), np.concatenate(ci), np.concatenate(sc)
+def _rare_tokens(df: pl.DataFrame, col: str, token_re: str, n: int, prefix: str) -> pl.DataFrame:
+    """Per row: the n rarest tokens (document frequency >= 2 within country) -> prefix_1..n."""
+    t = (df.select("rid", "country", pl.col(col).str.split(" ").alias("tok"))
+         .explode("tok")
+         .filter(pl.col("tok").str.contains(token_re))
+         .unique(["rid", "tok"]))
+    dfreq = t.group_by("country", "tok").agg(pl.len().alias("df"))
+    t = (t.join(dfreq, on=["country", "tok"]).filter(pl.col("df") >= 2)
+         .sort(["rid", "df", "tok"]).group_by("rid", maintain_order=True).head(n)
+         .with_columns(pl.col("rid").cum_count().over("rid").alias("k")))
+    wide = t.pivot(on="k", index="rid", values="tok")
+    wide = wide.rename({str(k): f"{prefix}_{k}" for k in range(1, n + 1) if str(k) in wide.columns})
+    for k in range(1, n + 1):
+        if f"{prefix}_{k}" not in wide.columns:
+            wide = wide.with_columns(pl.lit(None, pl.String).alias(f"{prefix}_{k}"))
+    return wide
 
 
-DEFAULT_BLOCKING = dict(
-    k_name=25, k_ph=15, k_addr=10, k_all=25, k_global=5, k_rev=3, max_per_s1=60,
-)
+def add_keys(s1: pl.DataFrame, tg: pl.DataFrame):
+    cols = ["country", "name_core", "name_ph", "name_ns", "addr_core", "first_num", "nums"]
+    both = pl.concat([s1.select(cols).with_columns(pl.lit(0).alias("side")),
+                      tg.select(cols).with_columns(pl.lit(1).alias("side"))]).with_row_index("rid")
+    nt = _rare_tokens(both, "name_core", r"^[a-z0-9]{2,}$", N_RARE, "nt")
+    at = _rare_tokens(both, "addr_core", r"^[a-z]{3,}$", N_RARE, "at")
+    b = both.join(nt, on="rid", how="left").join(at, on="rid", how="left").sort("rid")
+    keys = b.select("side", "country", **{k: e for k, (e, _, _) in _key_exprs().items()})
+    k1 = keys.filter(pl.col("side") == 0).drop("side").with_row_index("i")
+    kt = keys.filter(pl.col("side") == 1).drop("side").with_row_index("j")
+    return k1, kt
 
 
-def generate_candidates(s1, tg, vec: Vectors, cfg=None) -> pd.DataFrame:
-    """Union of several blocking passes; returns DataFrame(i, j) of index pairs."""
+def generate_candidates(s1: pl.DataFrame, tg: pl.DataFrame, cfg=None) -> pl.DataFrame:
+    """Returns DataFrame(i, j, nkeys, keymask, bscore) of candidate index pairs.
+
+    Runs one country at a time (keys never cross countries) to bound peak memory."""
     cfg = {**DEFAULT_BLOCKING, **(cfg or {})}
-    parts = []
-    c1 = s1["country"].values
-    ct = tg["country"].values
-    all_t = np.arange(len(tg))
-    for c in pd.unique(c1):
-        a_idx = np.where(c1 == c)[0]
-        b_idx = np.where(ct == c)[0]
-        if len(b_idx) == 0:  # unseen/mismatched country label -> search everything
-            b_idx = all_t
-        for key, k in (("name_char", cfg["k_name"]), ("name_ph", cfg["k_ph"]),
-                       ("addr_char", cfg["k_addr"]), ("all_word", cfg["k_all"])):
-            i, j, _ = _topk(vec.m1[key], vec.mt[key], k, a_idx, b_idx)
-            parts.append((i, j))
-        # reverse pass: every target gets its best S1 entities in the same country
-        j, i, _ = _topk(vec.mt["all_word"], vec.m1["all_word"], cfg["k_rev"], b_idx, a_idx)
-        parts.append((i, j))
-        j, i, _ = _topk(vec.mt["name_char"], vec.m1["name_char"], cfg["k_rev"], b_idx, a_idx)
-        parts.append((i, j))
-    # global name pass (country labels can be noisy / open-set)
-    i, j, _ = _topk(vec.m1["name_char"], vec.mt["name_char"], cfg["k_global"], np.arange(len(s1)), all_t)
-    parts.append((i, j))
-    # exact postal + first name token block
-    parts.append(_postal_block(s1, tg))
-
-    i = np.concatenate([p[0] for p in parts]); j = np.concatenate([p[1] for p in parts])
-    cand = pd.DataFrame({"i": i, "j": j}).drop_duplicates().reset_index(drop=True)
-
-    # cap per S1 by a cheap blocking score; keep reverse-best pairs regardless
-    cheap = (0.45 * vec.pair_cos("name_char", cand.i.values, cand.j.values)
-             + 0.2 * vec.pair_cos("name_ph", cand.i.values, cand.j.values)
-             + 0.35 * vec.pair_cos("all_word", cand.i.values, cand.j.values))
-    cand["cheap"] = cheap
-    cand["r1"] = cand.groupby("i")["cheap"].rank(ascending=False, method="first")
-    cand["rt"] = cand.groupby("j")["cheap"].rank(ascending=False, method="first")
-    cand = cand[(cand.r1 <= cfg["max_per_s1"]) | (cand.rt <= 2)]
-    return cand[["i", "j"]].reset_index(drop=True)
+    out = []
+    ct = tg["country"]
+    for c in s1["country"].unique().sort():
+        i_map = s1.with_row_index("gi").filter(pl.col("country") == c)
+        j_map = tg.with_row_index("gj").filter(ct == c)
+        if j_map.height == 0:
+            continue
+        cand = _candidates_one(i_map.drop("gi"), j_map.drop("gj"), cfg)
+        cand = cand.with_columns(i=i_map["gi"].gather(cand["i"]), j=j_map["gj"].gather(cand["j"]))
+        out.append(cand)
+        del i_map, j_map
+    cand = pl.concat(out) if out else pl.DataFrame(schema={"i": pl.UInt32, "j": pl.UInt32})
+    return cand.with_columns(pl.col("i").cast(pl.UInt32), pl.col("j").cast(pl.UInt32))
 
 
-def _postal_block(s1, tg, max_block=200):
-    t = tg[tg.addr_postal != ""].assign(j=lambda d: d.index.values)
-    t["ft"] = [c.split()[0] if c else "" for c in t.name_core]
-    a = s1[s1.addr_postal != ""].assign(i=lambda d: d.index.values)
-    a["ft"] = [c.split()[0] if c else "" for c in a.name_core]
-    m = a[["i", "addr_postal", "ft"]].merge(t[["j", "addr_postal", "ft"]], on=["addr_postal", "ft"])
-    m = m[m.groupby("i")["j"].transform("size") <= max_block]
-    return m.i.values, m.j.values
+def _candidates_one(s1: pl.DataFrame, tg: pl.DataFrame, cfg) -> pl.DataFrame:
+    caps = {**KEY_CAPS, **cfg.get("caps", {})}
+    assert len(caps) <= 32
+    k1, kt = add_keys(s1, tg)
+    cand = None
+    for bit, (key, (cap1, capt)) in enumerate(caps.items()):
+        def long(k, idx):
+            return (k.select(idx, key).explode(key).drop_nulls().rename({key: "kv"}).unique())
+        a, b = long(k1, "i"), long(kt, "j")
+        n1 = a.group_by("kv").agg(pl.len().alias("n1"))
+        nt = b.group_by("kv").agg(pl.len().alias("nt"))
+        ok = (n1.join(nt, on="kv").filter((pl.col("n1") <= cap1) & (pl.col("nt") <= capt))
+              .select("kv", w=1.0 / (1.0 + (pl.col("n1") * pl.col("nt")).cast(pl.Float32).log(2))))
+        p = (a.join(ok, on="kv").join(b, on="kv")
+             .group_by("i", "j").agg(pl.col("w").max())  # one vote per key type
+             .select("i", "j", nkeys=pl.lit(1, pl.UInt8), keymask=pl.lit(1 << bit, pl.UInt32),
+                     bscore=pl.col("w").cast(pl.Float32)))
+        del a, b, n1, nt, ok
+        cand = p if cand is None else (
+            pl.concat([cand, p]).group_by("i", "j")
+            .agg(pl.col("nkeys").sum().cast(pl.UInt8), pl.col("keymask").sum().cast(pl.UInt32),
+                 pl.col("bscore").sum().cast(pl.Float32)))
+    del k1, kt
+    # cap per S1: keep the candidates with the most specific shared evidence
+    return (cand.with_columns(pl.col("bscore").cast(pl.Float32))
+            .sort(["i", "bscore", "j"], descending=[False, True, False])
+            .group_by("i", maintain_order=True).head(cfg["max_per_s1"]))
 
 
-def blocking_recall(cand_ids: dict, truth: dict) -> float:
-    tot = hit = 0
-    for s, tr in truth.items():
-        tot += len(tr)
-        hit += len(tr & cand_ids.get(s, set()))
-    return hit / max(tot, 1)
+def blocking_recall(cand_pairs: pl.DataFrame, truth_pairs: pl.DataFrame) -> float:
+    """Both frames with columns (i, j) as UInt32."""
+    hit = truth_pairs.join(cand_pairs.select("i", "j"), on=["i", "j"], how="semi").height
+    return hit / max(truth_pairs.height, 1)

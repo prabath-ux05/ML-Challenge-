@@ -3,13 +3,18 @@
     python src/evaluate.py --pred output/matching_results.tsv --truth path/to/ground_truth.tsv [--source1 test_source1.tsv]
 """
 import argparse
-import os
-import sys
-
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pipeline import f05  # noqa: E402
+
+
+def f05(pred: set, true: set) -> float:
+    if not true:
+        return 1.0 if not pred else 0.0
+    tp = len(pred & true)
+    if tp == 0:
+        return 0.0
+    p, r = tp / len(pred), tp / len(true)
+    return 1.25 * p * r / (0.25 * p + r)
 
 
 def read_lists(path, col):

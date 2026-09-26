@@ -46,6 +46,40 @@ NAME_CANON = {
     "insurance": "ins", "ins": "ins",
     "financial": "fin", "finance": "fin",
     "holdings": "hldg", "holding": "hldg", "hldgs": "hldg",
+    # French
+    "societe": "soc", "soc": "soc",
+    "association": "assn", "assn": "assn",
+    "boulangerie": "boul", "patisserie": "pat",
+    "pharmacie": "pharm", "librairie": "lib",
+    "lycee": "lycee", "ecole": "ecole", "college": "college",
+    "maison": "maison", "atelier": "atelier",
+    "cabinet": "cab", "cab": "cab",
+    "immobilier": "immo", "immo": "immo",
+    "securite": "sec", "securite": "sec",
+    "transport": "trans", "transports": "trans", "trans": "trans",
+    "informatique": "info", "info": "info",
+    "conseil": "conseil", "consultants": "consult", "consultant": "consult", "consulting": "consult",
+    "garage": "garage",
+    "menuiserie": "menuiserie", "plomberie": "plomberie",
+    "coiffure": "coiffure",
+    # Additional common terms
+    "foundation": "fdn", "fdn": "fdn", "fondation": "fdn",
+    "global": "global", "worldwide": "global",
+    "electric": "elec", "electrical": "elec", "electronics": "elec", "elec": "elec",
+    "communications": "comm", "communication": "comm", "comm": "comm",
+    "construction": "const", "const": "const",
+    "engineering": "engg", "engg": "engg", "engr": "engg",
+    "general": "genl", "genl": "genl", "gen": "genl",
+    "education": "edu", "edu": "edu", "educational": "edu",
+    "medical": "med", "med": "med", "medicale": "med",
+    "properties": "prop", "property": "prop", "prop": "prop",
+    "development": "dev", "dev": "dev", "developpement": "dev",
+    "marketing": "mktg", "mktg": "mktg",
+    "products": "prod", "product": "prod", "prod": "prod", "produits": "prod",
+    "supply": "supply", "supplies": "supply",
+    "distribution": "dist", "distributing": "dist", "distributors": "dist",
+    "foods": "food", "food": "food",
+    "automobiles": "auto", "automotive": "auto", "auto": "auto",
 }
 
 # Legal-form / generic tokens removed to build the "core" name.
@@ -53,7 +87,9 @@ LEGAL_TOKENS = {
     "corp", "inc", "ltd", "pvt", "co", "llc", "llp", "lp", "plc", "pllc", "pc",
     "sa", "sas", "sarl", "eurl", "sasu", "sci", "snc", "scs", "selarl", "scop",
     "gmbh", "ag", "bv", "nv", "opc", "the", "and", "of", "le", "la", "les", "de",
-    "du", "des", "l", "d", "et",
+    "du", "des", "l", "d", "et", "soc", "assn",
+    # honorifics / prefixes seen in the data ("M/s ABC Traders", "Mr RKK Products", "Sri ...")
+    "ms", "mr", "mrs", "sri", "shri", "shree", "smt", "null",
 }
 
 # Multi-word phrases collapsed before tokenising.
@@ -149,6 +185,8 @@ CITY_CANON = {
     "orissa": "odisha", "cawnpore": "kanpur", "trichy": "tiruchirappalli",
     "tiruchirapalli": "tiruchirappalli", "calicut": "kozhikode",
     "philly": "philadelphia",
+    # French city variants
+    "marseilles": "marseille", "lyons": "lyon",
 }
 
 US_STATES = {
@@ -181,7 +219,7 @@ _STATE_RE = re.compile(r"\b(" + "|".join(re.escape(k) for k, _ in _STATE_PATTERN
 _STATE_MAP = dict(_STATE_PATTERNS)
 
 _LANDMARK_RE = re.compile(
-    r"\b(near|nr|opp|opposite|behind|beside|next to|adjacent to|in front of|close to|landmark)\b[^,;]*",
+    r"\b(near|nr|opp|opposite|behind|beside|next to|adjacent to|in front of|close to|landmark|pres de|a cote de|face a|devant)\b[^,;]*",
     re.I,
 )
 _NON_ALNUM = re.compile(r"[^a-z0-9 ]+")
@@ -190,12 +228,40 @@ _DIGITS = re.compile(r"\d+")
 _POSTAL6 = re.compile(r"(?<!\d)(\d{3})\s?(\d{3})(?!\d)")
 _POSTAL5 = re.compile(r"(?<!\d)(\d{5})(?:-\d{4})?(?!\d)")
 _DBA_RE = re.compile(r"\b(?:d\s*/?\s*b\s*/?\s*a|doing business as|t\s*/\s*a|trading as|aka|a\s*/\s*k\s*/\s*a)\b", re.I)
+# French region names that can be dropped for matching (they're administrative, not address-specific)
+_FR_REGIONS = {
+    "ile de france", "nouvelle aquitaine", "auvergne rhone alpes", "occitanie",
+    "hauts de france", "grand est", "provence alpes cote d azur", "pays de la loire",
+    "bretagne", "normandie", "bourgogne franche comte", "centre val de loire",
+    "corse",
+}
+
+
+_INDIC = re.compile(r"[\u0900-\u0DFF]")
+_TRANSLIT_FIX = [  # tokens produced by unidecode on Devanagari/Kannada/Tamil/... legal words
+    (re.compile(r"\b(?:pr[aiey]+[vb]h?[aeiry]*t+\w*|pr[aie]+v\w*)\b"), "private"),
+    (re.compile(r"\blimi\w*\b|\blmtd\b"), "limited"),
+    (re.compile(r"\bk[ae]mp[ae]?n\w*\b"), "company"),
+]
 
 
 def ascii_lower(s) -> str:
     if s is None or (isinstance(s, float) and s != s):
         return ""
-    return unidecode(str(s)).lower()
+    s = str(s)
+    if _INDIC.search(s):  # transliterate, then undo unidecode's doubled letters
+        t = unidecode(s).lower().replace("'", "")
+        t = re.sub(r"([a-z])\1+", r"\1", t)
+        for pat, rep in _TRANSLIT_FIX:
+            t = pat.sub(rep, t)
+        return t
+    return unidecode(s).lower()
+
+
+_WEB_RE = re.compile(r"(^|\s)(?:https?://)?(?:www\.)?([a-z0-9-]+)\.(?:com|net|org|in|co\.in|co|fr|us|biz|info|io)\b")
+_HANDLE_RE = re.compile(r"(^|\s)@([a-z0-9_]+)")
+_OCR_DIGIT = {"0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "8": "b"}
+_OCR_RE = re.compile(r"(?<=[a-z])[013458](?=[a-z])")
 
 
 def _basic(s: str) -> str:
@@ -211,9 +277,15 @@ def _split_alnum(s: str) -> str:
     return re.sub(r"([a-z])(\d)", r"\1 \2", s)
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=1 << 16)
 def norm_name(raw: str) -> str:
     s = ascii_lower(raw)
+    s = _WEB_RE.sub(r"\1\2", s)  # "gulfbrc.com" -> "gulfbrc"
+    s = _HANDLE_RE.sub(r"\1\2", s)  # "@casillasconcord" -> "casillasconcord"
+    s = _OCR_RE.sub(lambda m: _OCR_DIGIT[m.group(0)], s)  # "fa1con" -> "falcon"
+    s = re.sub(r"^\s*m\s*/\s*s\b", " ", s)  # "M/s ABC" -> "ABC"
+    s = re.sub(r"\bpr[il]v[a-z]?te\b", "private", s)  # OCR "PRlVATE"
+    s = re.sub(r"\bl[il]m[il]ted\b", "limited", s)
     s = re.sub(r"(?<=\b[a-z])\.(?=[a-z]\b)", "", s)  # "i.b.m" -> "ibm"
     s = s.replace(".", " ")
     for pat, rep in NAME_PHRASES:
@@ -222,7 +294,7 @@ def norm_name(raw: str) -> str:
     return " ".join(NAME_CANON.get(t, t) for t in s.split())
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=1 << 16)
 def name_variants(raw: str) -> tuple:
     """Full name plus DBA/trade-name parts and bracketed aliases."""
     s = ascii_lower(raw)
@@ -240,7 +312,7 @@ def name_variants(raw: str) -> tuple:
     return tuple(out)
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=1 << 16)
 def core_name(normed: str) -> str:
     toks = [t for t in normed.split() if t not in LEGAL_TOKENS]
     return " ".join(toks) if toks else normed
@@ -251,7 +323,7 @@ def acronym(core: str) -> str:
     return "".join(t[0] for t in toks if t and not t.isdigit()) if len(toks) > 1 else ""
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=1 << 16)
 def phonetic(s: str) -> str:
     """Crude transliteration-tolerant key (Indian/French spelling variants, typos)."""
     s = re.sub(r"(ph)", "f", s)
@@ -272,7 +344,7 @@ def _is_fr(country: str) -> bool:
     return country.startswith("fr") or "france" in country
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=1 << 16)
 def norm_address(raw: str, country: str = "") -> dict:
     s0 = ascii_lower(raw)
     landmark = " ".join(m.group(0) for m in _LANDMARK_RE.finditer(s0))
@@ -292,12 +364,20 @@ def norm_address(raw: str, country: str = "") -> dict:
             if fr and tok == "st":
                 toks.append("st")  # saint
                 continue
+            if tok in ("null", "none", "nan", "na"):
+                continue
             tok = ADDR_CANON.get(tok, tok)
             toks.append(CITY_CANON.get(tok, tok))
         return " ".join(toks)
 
     full = canon(s0)
     core = canon(no_lm)
+    # strip French region names from core (they are administrative, not address-specific)
+    if _is_fr(country):
+        core_low = core
+        for reg in _FR_REGIONS:
+            core_low = core_low.replace(reg, " ")
+        core = _WS.sub(" ", core_low).strip()
     core_np = _POSTAL5.sub(" ", _POSTAL6.sub(" ", core)) if postal else core
     nums = _DIGITS.findall(core_np)
     return {

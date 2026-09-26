@@ -1,6 +1,9 @@
-# Python 3.10+ (tested on 3.14). All licenses permissive (BSD/MIT). No pretrained models, no external lookups.
+# Python 3.10+ (tested on 3.14). All licenses permissive (BSD/MIT/Apache-2.0).
+# No pretrained models, no external lookups.
 numpy==2.5.3
 pandas==3.0.6
+polars==1.44.2
+pyarrow==25.0.1
 scipy==1.18.1
 scikit-learn==1.9.1
 rapidfuzz==3.14.6

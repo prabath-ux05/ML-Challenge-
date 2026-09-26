@@ -13,3 +13,6 @@ output/
 
 # OS
 .DS_Store
+
+# Pipeline cache (normalised data, candidates, features, models)
+work/

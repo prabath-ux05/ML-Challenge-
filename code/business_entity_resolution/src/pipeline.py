@@ -1,10 +1,15 @@
-"""End-to-end entity-resolution pipeline.
+"""End-to-end entity-resolution pipeline (scales to the full 2M x 10M challenge data).
 
-    python src/pipeline.py train   --data-dir ../../dataset --model-dir models
-    python src/pipeline.py predict --data-dir ../../dataset --model-dir models --out-dir ../../output
-    python src/pipeline.py run     ... (train + predict)
+    python src/pipeline.py train   --data-dir dataset --work-dir work
+    python src/pipeline.py predict --data-dir dataset --work-dir work --out-dir output
+    python src/pipeline.py run     ...   (train + predict)
+
+Stages: normalise (parallel, cached) -> key blocking -> pair features (chunked parquet)
+-> group features -> stage-1 GBDT (K folds, OOF on every train pair) -> context features
+-> stage-2 GBDT -> F0.5-optimal decision (tuned on OOF) -> TSV outputs.
 """
 import argparse
+import glob
 import json
 import os
 import sys
@@ -12,13 +17,14 @@ import time
 
 import joblib
 import numpy as np
-import pandas as pd
+import polars as pl
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.model_selection import GroupKFold
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from blocking import Vectors, blocking_recall, generate_candidates, load_source, prepare  # noqa: E402
-from features import context_features, pair_features  # noqa: E402
+from blocking import DEFAULT_BLOCKING, blocking_recall, generate_candidates  # noqa: E402
+from features import (GROUP_BASE, context_features, group_features, name_frequencies,  # noqa: E402
+                      pair_features)
+from prep import load_split  # noqa: E402
 
 T0 = time.time()
 
@@ -28,93 +34,100 @@ def log(*a):
 
 
 # ---------------------------------------------------------------------------
-# data
+# cached stages
 # ---------------------------------------------------------------------------
-def load_split(data_dir, split):
-    d = os.path.join(data_dir, split)
-    s1 = load_source(os.path.join(d, f"{split}_source1.tsv"))
-    tg = pd.concat([load_source(os.path.join(d, f"{split}_source{k}.tsv")) for k in (2, 3)], ignore_index=True)
-    return prepare(s1), prepare(tg)
+def candidates(split, s1, tg, work, block_cfg):
+    path = os.path.join(work, f"{split}_cand.parquet")
+    if os.path.exists(path):
+        return pl.read_parquet(path)
+    cand = generate_candidates(s1, tg, block_cfg).sort("i", "j")
+    cand.write_parquet(path)
+    return cand
 
 
-def load_truth(data_dir):
-    gt = pd.read_csv(os.path.join(data_dir, "train", "train_ground_truth.tsv"), sep="\t", dtype=str,
-                     keep_default_na=False)
-    return {r.source1_entity_id.strip(): {x.strip() for x in r.matched_entity_ids.split(",") if x.strip()}
-            for r in gt.itertuples()}
+def feature_parts(split, s1, tg, cand, work, chunk=3_000_000):
+    """Pair features written as row-aligned parquet parts + one group-feature file."""
+    fdir = os.path.join(work, f"{split}_feat")
+    done = os.path.join(fdir, "_DONE")
+    if not os.path.exists(done):
+        os.makedirs(fdir, exist_ok=True)
+        f1, ft = name_frequencies(s1, tg)
+        slim = []
+        for k, s in enumerate(range(0, cand.height, chunk)):
+            F = pair_features(s1, tg, cand.slice(s, chunk), f1, ft)
+            F.write_parquet(os.path.join(fdir, f"part_{k:04d}.parquet"))
+            slim.append(F.select([c for c in GROUP_BASE if c in F.columns]))
+            log(f"  features {split}: {min(s + chunk, cand.height)}/{cand.height}")
+        slim = pl.concat([cand.select("i", "j"), pl.concat(slim)], how="horizontal")
+        group_features(slim).write_parquet(os.path.join(fdir, "group.parquet"))
+        open(done, "w").close()
+    return sorted(glob.glob(os.path.join(fdir, "part_*.parquet"))), os.path.join(fdir, "group.parquet")
 
 
-def build(s1, tg, block_cfg=None):
-    log(f"records: S1={len(s1)} S2+S3={len(tg)}")
-    vec = Vectors(s1, tg)
-    cand = generate_candidates(s1, tg, vec, block_cfg)
-    log(f"candidates: {len(cand)} pairs ({len(cand) / max(len(s1), 1):.1f} per S1)")
-    F = pair_features(s1, tg, cand, vec)
-    log(f"pair features: {F.shape}")
-    cand = cand.assign(s1_id=s1.id.values[cand.i.values], tg_id=tg.id.values[cand.j.values])
-    return vec, cand, F
+def iter_X(parts, group_path, extra=None, rows=None):
+    """Yield (offset, X) chunks = pair features + group features (+ extra columns)."""
+    G = pl.read_parquet(group_path)
+    off = 0
+    for p in parts:
+        F = pl.read_parquet(p)
+        n = F.height
+        X = pl.concat([F, G.slice(off, n)] + ([extra.slice(off, n)] if extra is not None else []), how="horizontal")
+        if rows is not None:
+            X = X.filter(rows[off:off + n])
+        yield off, n, X
+        off += n
 
 
 # ---------------------------------------------------------------------------
-# metric + decision
+# metric + decision (vectorised)
 # ---------------------------------------------------------------------------
-def f05(pred: set, true: set) -> float:
-    if not true:
-        return 1.0 if not pred else 0.0
-    if not pred:
-        return 0.0
-    tp = len(pred & true)
-    if tp == 0:
-        return 0.0
-    p, r = tp / len(pred), tp / len(true)
-    return 1.25 * p * r / (0.25 * p + r)
+def macro_f05(pred: pl.DataFrame, truth: pl.DataFrame, s1_idx: pl.Series) -> float:
+    """pred/truth: (i, j) pairs. s1_idx: all S1 indices being evaluated (singletons included)."""
+    base = pl.DataFrame({"i": s1_idx.cast(pl.UInt32)})
+    tp = pred.join(truth, on=["i", "j"], how="semi").group_by("i").agg(pl.len().alias("tp"))
+    npred = pred.group_by("i").agg(pl.len().alias("np"))
+    ntrue = truth.group_by("i").agg(pl.len().alias("nt"))
+    d = (base.join(tp, on="i", how="left").join(npred, on="i", how="left").join(ntrue, on="i", how="left")
+         .fill_null(0))
+    P = pl.col("tp") / pl.col("np")
+    R = pl.col("tp") / pl.col("nt")
+    f = (pl.when(pl.col("nt") == 0).then((pl.col("np") == 0).cast(pl.Float64))
+         .when(pl.col("tp") == 0).then(0.0)
+         .otherwise(1.25 * P * R / (0.25 * P + R)))
+    return d.select(f.mean()).item()
 
 
-def macro_f05(preds: dict, truth: dict, ids) -> float:
-    return float(np.mean([f05(preds.get(s, set()), truth.get(s, set())) for s in ids]))
-
-
-def decide(cand: pd.DataFrame, p: np.ndarray, s1_ids, params: dict) -> dict:
-    d = cand[["s1_id", "tg_id"]].assign(p=p)
+def decide(ij: pl.DataFrame, p: np.ndarray, params: dict) -> pl.DataFrame:
+    """Return selected (i, j) pairs."""
+    d = ij.select("i", "j").with_columns(p=pl.Series(np.clip(p * params.get("scale", 1.0), 0, 1), dtype=pl.Float64))
     if params.get("one_to_one", True):
-        d = d[d.p >= d.groupby("tg_id")["p"].transform("max") - 1e-9]
-    pool = d.groupby("s1_id")["p"].apply(lambda x: np.clip(x.values, 0, 1)).to_dict()
-    d = d[d.p >= params["floor"]]
-    out = {s: set() for s in s1_ids}
+        d = d.filter(pl.col("p") >= pl.col("p").max().over("j") - 1e-9)
     if params["mode"] == "thr":
-        for s, t in zip(d.s1_id.values, d.tg_id.values):
-            out[s].add(t)
-        return out
-    # expected-F0.5 maximisation per S1 entity (candidates as independent Bernoullis)
-    d = d.sort_values(["s1_id", "p"], ascending=[True, False])
-    for s, grp in d.groupby("s1_id", sort=False):
-        ps = np.clip(grp.p.values * params.get("scale", 1.0), 0, 1)
-        tot = pool[s].sum()
-        best_k, best = 0, float(np.prod(1 - pool[s]))  # predicting empty = P(no match at all)
-        tp = 0.0
-        for k in range(1, len(ps) + 1):
-            tp += ps[k - 1]
-            fp, fn = k - tp, max(tot - tp, 0)
-            ef = 1.25 * tp / (1.25 * tp + 0.25 * fn + fp)
-            if ef > best:
-                best, best_k = ef, k
-        out[s] = set(grp.tg_id.values[:best_k])
-    return out
+        return d.filter(pl.col("p") >= params["floor"]).select("i", "j")
+    # expected-F0.5 maximisation per S1 (candidates as independent Bernoullis)
+    d = d.with_columns(
+        tot=pl.col("p").sum().over("i"),
+        p_empty=(1 - pl.col("p") + 1e-9).log().sum().over("i").exp(),
+    ).filter(pl.col("p") >= params["floor"]).sort(["i", "p"], descending=[False, True])
+    d = d.with_columns(k=pl.col("p").cum_count().over("i"), tp=pl.col("p").cum_sum().over("i"))
+    d = d.with_columns(ef=1.25 * pl.col("tp") / (1.25 * pl.col("tp") + 0.25 * (pl.col("tot") - pl.col("tp"))
+                                                  + (pl.col("k") - pl.col("tp"))))
+    d = d.with_columns(best=pl.col("ef").max().over("i"))
+    kbest = d.filter(pl.col("ef") == pl.col("best")).group_by("i").agg(pl.col("k").min().alias("kb"))
+    d = d.join(kbest, on="i").filter((pl.col("k") <= pl.col("kb")) & (pl.col("best") > pl.col("p_empty")))
+    return d.select("i", "j")
 
 
-def tune_decision(cand, p, truth, s1_ids):
+def tune_decision(ij, p, truth, s1_idx):
     best = None
-    for o2o in (True, False):
-        for thr in np.round(np.arange(0.2, 0.96, 0.025), 3):
-            prm = dict(mode="thr", floor=float(thr), one_to_one=o2o)
-            sc = macro_f05(decide(cand, p, s1_ids, prm), truth, s1_ids)
-            if best is None or sc > best[0]:
-                best = (sc, prm)
-        for floor in (0.02, 0.1, 0.2, 0.3, 0.4):
-            prm = dict(mode="ef", floor=floor, one_to_one=o2o)
-            sc = macro_f05(decide(cand, p, s1_ids, prm), truth, s1_ids)
-            if sc > best[0]:
-                best = (sc, prm)
+    grid = [dict(mode="thr", floor=float(t), one_to_one=o) for o in (True, False)
+            for t in np.round(np.arange(0.15, 0.96, 0.02), 3)]
+    grid += [dict(mode="ef", floor=f, one_to_one=o, scale=sc) for o in (True, False)
+             for f in (0.01, 0.05, 0.1, 0.2, 0.3) for sc in (0.9, 1.0, 1.1)]
+    for prm in grid:
+        sc = macro_f05(decide(ij, p, prm), truth, s1_idx)
+        if best is None or sc > best[0]:
+            best = (sc, prm)
     return best
 
 
@@ -123,120 +136,152 @@ def tune_decision(cand, p, truth, s1_ids):
 # ---------------------------------------------------------------------------
 def make_model(seed):
     return HistGradientBoostingClassifier(
-        learning_rate=0.05, max_iter=800, max_leaf_nodes=48, min_samples_leaf=30,
-        l2_regularization=1.0, early_stopping=True, validation_fraction=0.1,
-        n_iter_no_change=50, random_state=seed)
+        learning_rate=0.08, max_iter=600, max_leaf_nodes=127, min_samples_leaf=50,
+        l2_regularization=1.0, early_stopping=True, validation_fraction=0.08,
+        n_iter_no_change=30, random_state=seed)
 
 
-def cv_fit(X, y, groups, folds, seed=0):
-    oof = np.zeros(len(y), dtype=np.float32)
+def fit_oof(parts, gpath, extra, y, fold, train_rows, K, seed, cols=None):
+    """Train K fold models on sampled rows; predict every row out-of-fold."""
+    Xs = pl.concat([X for _, _, X in iter_X(parts, gpath, extra, rows=train_rows)])
+    cols = cols or Xs.columns
+    Xs = Xs.select(cols).to_numpy()
+    ys, fs = y[train_rows], fold[train_rows]
+    log(f"  training rows {len(ys)} x {Xs.shape[1]} features, positives {ys.mean():.3f}")
     models = []
-    for k, (tr, va) in enumerate(GroupKFold(n_splits=folds).split(X, y, groups)):
-        m = make_model(seed + k).fit(X.iloc[tr], y[tr])
-        oof[va] = m.predict_proba(X.iloc[va])[:, 1]
+    for k in range(K):
+        m = make_model(seed + k).fit(Xs[fs != k], ys[fs != k])
         models.append(m)
-    return oof, models
+        log(f"  fold {k}: {m.n_iter_} iters")
+    del Xs
+    oof = np.zeros(len(y), dtype=np.float32)
+    for off, n, X in iter_X(parts, gpath, extra):
+        Xn = X.select(cols).to_numpy()
+        fk = fold[off:off + n]
+        for k in range(K):
+            m = fk == k
+            if m.any():
+                oof[off:off + n][m] = models[k].predict_proba(Xn[m])[:, 1]
+    return oof, models, cols
 
 
-def predict_avg(models, X):
-    return np.mean([m.predict_proba(X)[:, 1] for m in models], axis=0)
+def predict_avg(models, parts, gpath, extra, cols):
+    out = []
+    for _, _, X in iter_X(parts, gpath, extra):
+        Xn = X.select(cols).to_numpy()
+        out.append(np.mean([m.predict_proba(Xn)[:, 1] for m in models], axis=0))
+    return np.concatenate(out).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
+def load_truth(data_dir, s1, tg):
+    gt = pl.read_csv(os.path.join(data_dir, "train", "train_ground_truth.tsv"), separator="\t",
+                     infer_schema=False).fill_null("")
+    return (gt.with_columns(pl.col("matched_entity_ids").str.split(",")).explode("matched_entity_ids")
+            .filter(pl.col("matched_entity_ids").str.strip_chars() != "")
+            .join(s1.select("id").with_row_index("i"), left_on="source1_entity_id", right_on="id")
+            .join(tg.select("id").with_row_index("j"),
+                  left_on=pl.col("matched_entity_ids").str.strip_chars(), right_on="id")
+            .select(pl.col("i").cast(pl.UInt32), pl.col("j").cast(pl.UInt32)))
+
+
 def cmd_train(a):
-    s1, tg = load_split(a.data_dir, "train")
-    truth = load_truth(a.data_dir)
-    s1_ids = s1.id.tolist()
-    tg_owner = {}
-    for s, ts in truth.items():
-        for t in ts:
-            tg_owner.setdefault(t, []).append(s)
-    multi = sum(len(v) > 1 for v in tg_owner.values())
-    log(f"truth: {sum(map(len, truth.values()))} links, singletons={sum(not v for v in truth.values())}"
-        f"/{len(truth)}, targets linked to >1 S1: {multi}")
+    work = a.work_dir
+    s1, tg = load_split(a.data_dir, "train", os.path.join(work, "norm"), a.workers)
+    log(f"train records: S1={s1.height} S2+S3={tg.height}")
+    truth = load_truth(a.data_dir, s1, tg)
+    multi = truth.group_by("j").len().filter(pl.col("len") > 1).height
+    log(f"truth links={truth.height}, targets linked to >1 S1: {multi}")
+    cand = candidates("train", s1, tg, work, a.block_cfg)
+    log(f"candidates: {cand.height} ({cand.height / s1.height:.1f} per S1), "
+        f"blocking recall={blocking_recall(cand, truth):.4f}")
+    all_i = pl.Series(np.arange(s1.height, dtype=np.uint32))
+    log(f"oracle macro-F0.5 given candidates: "
+        f"{macro_f05(cand.join(truth, on=['i', 'j'], how='semi'), truth, all_i):.4f}")
+    y = cand.join(truth.with_columns(pl.lit(1, pl.Int8).alias("y")), on=["i", "j"], how="left")["y"] \
+        .fill_null(0).to_numpy()
+    parts, gpath = feature_parts("train", s1, tg, cand, work)
+    log("features ready")
 
-    vec, cand, F = build(s1, tg, a.block_cfg)
-    y = np.array([t in truth.get(s, ()) for s, t in zip(cand.s1_id, cand.tg_id)], dtype=np.int8)
-    cset = cand.groupby("s1_id")["tg_id"].apply(set).to_dict()
-    log(f"blocking recall ceiling: {blocking_recall(cset, truth):.4f}  positives in cands={y.sum()}")
-    ceiling = macro_f05({s: cset.get(s, set()) & truth.get(s, set()) for s in s1_ids}, truth, s1_ids)
-    log(f"oracle macro-F0.5 given candidates: {ceiling:.4f}")
+    h = s1.select(pl.col("id").hash(seed=7)).to_series().to_numpy()
+    fold_s1 = (h % a.folds).astype(np.int8)
+    samp_s1 = ((h // a.folds) % 1000) < int(a.sample * 1000)
+    ci = cand["i"].to_numpy()
+    fold, train_rows = fold_s1[ci], samp_s1[ci]
 
-    groups = cand.s1_id.values
-    oof1, m1 = cv_fit(F, y, groups, a.folds)
-    log("stage-1 OOF done")
-    C = context_features(cand, oof1, vec)
-    X2 = pd.concat([F, C], axis=1)
-    oof2, m2 = cv_fit(X2, y, groups, a.folds, seed=100)
-    log("stage-2 OOF done")
+    oof1, m1, cols1 = fit_oof(parts, gpath, None, y, fold, train_rows, a.folds, seed=0)
+    log("stage-1 done")
+    C = context_features(cand, oof1)
+    oof2, m2, cols2 = fit_oof(parts, gpath, C, y, fold, train_rows, a.folds, seed=100)
+    log("stage-2 done")
 
+    # tune the decision on held-out S1 (not used for fitting) -- all their competitors are scored OOF
+    eval_i = pl.Series(np.where(~samp_s1)[0].astype(np.uint32))
+    if len(eval_i) > a.eval_s1:
+        eval_i = eval_i.sample(a.eval_s1, seed=1)
+    sub = pl.DataFrame({"i": eval_i})
+    # restrict to eval S1 candidates + every competing pair for their targets (needed by one-to-one)
+    tj = cand.join(sub, on="i", how="semi").select("j").unique()
+    keep = cand.with_row_index("r").join(tj, on="j", how="semi")["r"].to_numpy()
+    ev_cand, ev_truth = cand[keep], truth.join(sub, on="i", how="semi")
     res = {}
     for name, p in (("stage1", oof1), ("stage2", oof2)):
-        sc, prm = tune_decision(cand, p, truth, s1_ids)
-        res[name] = (sc, prm)
+        sc, prm = tune_decision(ev_cand, p[keep], ev_truth, eval_i)
+        res[name] = {"f05": sc, "params": prm}
         log(f"{name}: OOF macro-F0.5={sc:.4f} with {prm}")
-    stage = "stage2" if res["stage2"][0] >= res["stage1"][0] else "stage1"
-    params = res[stage][1]
-    preds = decide(cand, oof2 if stage == "stage2" else oof1, s1_ids, params)
-    for c in sorted(s1.country.unique()):
-        ids = s1.id[s1.country == c].tolist()
-        log(f"  country={c!r}: n={len(ids)} F0.5={macro_f05(preds, truth, ids):.4f}")
-    sing = [s for s in s1_ids if not truth.get(s)]
-    nons = [s for s in s1_ids if truth.get(s)]
-    log(f"  singletons F0.5={macro_f05(preds, truth, sing):.4f}  matched-entities F0.5={macro_f05(preds, truth, nons):.4f}")
+    stage = "stage2" if res["stage2"]["f05"] >= res["stage1"]["f05"] else "stage1"
+    pred = decide(cand, oof2 if stage == "stage2" else oof1, res[stage]["params"])
+    for c in sorted(s1["country"].unique()):
+        ids = pl.Series(np.where(s1["country"].to_numpy() == c)[0].astype(np.uint32))
+        log(f"  country={c!r}: F0.5={macro_f05(pred, truth, ids):.4f}")
+    sing = set(range(s1.height)) - set(truth["i"].unique().to_list())
+    sing = pl.Series(sorted(sing), dtype=pl.UInt32)
+    log(f"  singletons F0.5={macro_f05(pred, truth, sing):.4f} (n={len(sing)})")
 
-    os.makedirs(a.model_dir, exist_ok=True)
-    joblib.dump(dict(m1=m1, m2=m2, stage=stage, params=params, cols1=list(F.columns), cols2=list(X2.columns),
-                     block_cfg=a.block_cfg), os.path.join(a.model_dir, "model.joblib"))
-    with open(os.path.join(a.model_dir, "cv_report.json"), "w") as f:
-        json.dump({k: {"f05": v[0], "params": v[1]} for k, v in res.items()} | {"chosen": stage}, f, indent=2)
-    if a.dump_oof:
-        cand.assign(y=y, p1=oof1, p2=oof2).to_csv(os.path.join(a.model_dir, "oof_pairs.tsv"), sep="\t", index=False)
-    log(f"saved model to {a.model_dir}")
+    joblib.dump(dict(m1=m1, m2=m2, cols1=cols1, cols2=cols2, stage=stage, params=res[stage]["params"],
+                     block_cfg=a.block_cfg), os.path.join(work, "model.joblib"))
+    with open(os.path.join(work, "cv_report.json"), "w") as f:
+        json.dump(res | {"chosen": stage}, f, indent=2)
+    log(f"saved model to {work}")
 
 
-def write_list_tsv(path, s1_ids, mapping, col):
-    with open(path, "w") as f:
-        f.write(f"source1_entity_id\t{col}\n")
-        for s in s1_ids:
-            f.write(f"{s}\t{','.join(sorted(mapping.get(s, ())))}\n")
+def write_lists(path, s1_ids, pairs: pl.DataFrame, tg_ids, col):
+    lists = (pairs.with_columns(pl.Series("tid", tg_ids)[pairs["j"]])
+             .group_by("i").agg(pl.col("tid").unique().sort().str.join(",")))
+    out = (pl.DataFrame({"source1_entity_id": s1_ids}).with_row_index("i")
+           .with_columns(pl.col("i").cast(pl.UInt32))
+           .join(lists, on="i", how="left").sort("i")
+           .select("source1_entity_id", pl.col("tid").fill_null("").alias(col)))
+    out.write_csv(path, separator="\t", quote_style="never")
 
 
 def cmd_predict(a):
-    bundle = joblib.load(os.path.join(a.model_dir, "model.joblib"))
-    s1, tg = load_split(a.data_dir, "test")
-    vec, cand, F = build(s1, tg, bundle["block_cfg"])
-    F = F[bundle["cols1"]]
-    p1 = predict_avg(bundle["m1"], F)
-    p = p1
-    if bundle["stage"] == "stage2":
-        X2 = pd.concat([F, context_features(cand, p1, vec)], axis=1)[bundle["cols2"]]
-        p = predict_avg(bundle["m2"], X2)
-    s1_ids = s1.id.tolist()
-    preds = decide(cand, p, s1_ids, bundle["params"])
-    cset = cand.groupby("s1_id")["tg_id"].apply(set).to_dict()
+    work = a.work_dir
+    b = joblib.load(os.path.join(work, "model.joblib"))
+    s1, tg = load_split(a.data_dir, "test", os.path.join(work, "norm"), a.workers)
+    log(f"test records: S1={s1.height} S2+S3={tg.height}")
+    cand = candidates("test", s1, tg, work, b["block_cfg"])
+    log(f"candidates: {cand.height} ({cand.height / s1.height:.1f} per S1)")
+    parts, gpath = feature_parts("test", s1, tg, cand, work)
+    p = predict_avg(b["m1"], parts, gpath, None, b["cols1"])
+    if b["stage"] == "stage2":
+        p = predict_avg(b["m2"], parts, gpath, context_features(cand, p), b["cols2"])
+    pred = decide(cand, p, b["params"])
     os.makedirs(a.out_dir, exist_ok=True)
-    write_list_tsv(os.path.join(a.out_dir, "matching_results.tsv"), s1_ids, preds, "matched_entity_ids")
-    write_list_tsv(os.path.join(a.out_dir, "candidate_pairs.tsv"), s1_ids, cset, "candidate_entity_ids")
+    s1_ids, tg_ids = s1["id"].to_list(), tg["id"].to_list()
+    write_lists(os.path.join(a.out_dir, "matching_results.tsv"), s1_ids, pred, tg_ids, "matched_entity_ids")
+    write_lists(os.path.join(a.out_dir, "candidate_pairs.tsv"), s1_ids, cand, tg_ids, "candidate_entity_ids")
     if a.dump_scores:
-        cand.assign(p=p).to_csv(os.path.join(a.out_dir, "test_pair_scores.tsv"), sep="\t", index=False)
-    n_match = sum(bool(v) for v in preds.values())
-    log(f"wrote outputs to {a.out_dir}: {n_match}/{len(s1_ids)} S1 with matches, "
-        f"{sum(map(len, preds.values()))} links")
-    for c in sorted(s1.country.unique()):
-        ids = s1.id[s1.country == c]
-        log(f"  country={c!r}: n={len(ids)} matched-rate={np.mean([bool(preds[s]) for s in ids]):.3f}")
-    self_check(s1_ids, set(tg.id), preds, cset)
-
-
-def self_check(s1_ids, tg_ids, preds, cset):
-    assert len(set(s1_ids)) == len(s1_ids), "duplicate S1 ids"
-    for s, ts in preds.items():
-        assert ts <= tg_ids, f"{s}: unknown target ids"
-        assert ts <= cset.get(s, set()), f"{s}: match not in candidates"
-        assert all(t[:3] in ("S2-", "S3-") for t in ts)
+        cand.select("i", "j").with_columns(p=pl.Series(p)).write_parquet(os.path.join(work, "test_scores.parquet"))
+    matched = pred["i"].n_unique()
+    log(f"wrote {a.out_dir}: {matched}/{s1.height} S1 with matches, {pred.height} links")
+    for c in sorted(s1["country"].unique()):
+        idx = np.where(s1["country"].to_numpy() == c)[0]
+        rate = pred.filter(pl.col("i").is_in(idx.astype(np.uint32))).select("i").n_unique() / len(idx)
+        log(f"  country={c!r}: n={len(idx)} matched-rate={rate:.3f}")
+    assert pred.join(cand, on=["i", "j"], how="anti").height == 0, "match outside candidates"
     log("self-check PASS")
 
 
@@ -244,13 +289,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("command", choices=["train", "predict", "run"])
     ap.add_argument("--data-dir", default="dataset")
-    ap.add_argument("--model-dir", default="models")
+    ap.add_argument("--work-dir", default="work", help="cache for normalised data, candidates, features, model")
     ap.add_argument("--out-dir", default="output")
-    ap.add_argument("--folds", type=int, default=5)
-    ap.add_argument("--block-cfg", type=json.loads, default=None, help='JSON, e.g. {"k_name":40}')
-    ap.add_argument("--dump-oof", action="store_true")
+    ap.add_argument("--folds", type=int, default=4)
+    ap.add_argument("--sample", type=float, default=0.1, help="fraction of S1 entities used to fit models")
+    ap.add_argument("--eval-s1", type=int, default=300_000, help="held-out S1 used to tune the decision")
+    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    ap.add_argument("--block-cfg", type=json.loads, default=None, help='JSON, e.g. {"max_per_s1":40}')
     ap.add_argument("--dump-scores", action="store_true")
     a = ap.parse_args()
+    a.block_cfg = {**DEFAULT_BLOCKING, **(a.block_cfg or {})}
     if a.command in ("train", "run"):
         cmd_train(a)
     if a.command in ("predict", "run"):
