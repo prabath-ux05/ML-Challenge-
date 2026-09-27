@@ -251,8 +251,8 @@ Options containing v3.1 are optimistic in the test-like world, because v3.1 neve
 
 **Reproducing the final submission:**
 ```
-# v3.1: original data, code at commit 2e476ba
-git checkout 2e476ba -- code/ && python code/business_entity_resolution/src/pipeline.py run --data-dir dataset --work-dir work --out-dir output_v31
+# v3.1: original data, code at commit 72c22ce
+git checkout 72c22ce -- code/ && python code/business_entity_resolution/src/pipeline.py run --data-dir dataset --work-dir work --out-dir output_v31
 git checkout main -- code/
 # v5: synthetic decoy groups + current code
 python code/business_entity_resolution/src/augment_decoys.py --data-dir dataset --out-dir dataset_aug

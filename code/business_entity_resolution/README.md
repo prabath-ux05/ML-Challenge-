@@ -65,8 +65,8 @@ Diagnostics: `src/shift_report.py` (score profiles, train OOF vs test) and `src/
 
 ## Reproducing the final submission (public LB 0.972287)
 The final `output/` is the average of two runs, with the decision re-tuned on held-out training entities:
-1. **v3.1** (original data), code at commit `2e476ba`:
-   `git checkout 2e476ba -- code/` then `python code/business_entity_resolution/src/pipeline.py run --data-dir dataset --work-dir work --out-dir output_v31`, then `git checkout main -- code/`.
+1. **v3.1** (original data), code at commit `72c22ce`:
+   `git checkout 72c22ce -- code/` then `python code/business_entity_resolution/src/pipeline.py run --data-dir dataset --work-dir work --out-dir output_v31`, then `git checkout main -- code/`.
 2. **v5** (synthetic decoy groups, current code):
    ```bash
    python code/business_entity_resolution/src/augment_decoys.py --data-dir dataset --out-dir dataset_aug
@@ -82,7 +82,7 @@ The final `output/` is the average of two runs, with the decision re-tuned on he
    python code/business_entity_resolution/src/country_adjust.py --works work work_v4 work_v5 --candidate 'work+work_v5' --country france --factors 0.52 --agree-with work_v5 --out-prefix output_fr
    cp output_fr_0.52/*.tsv output/
    ```
-   (`work_v4` is only a placeholder in `--works`: `pipeline.py run --data-dir dataset_aug --work-dir work_v4 --folds 4` at commit `a320aa0`; the chosen candidate does not use its scores.)
+   (`work_v4` is only a placeholder in `--works`: `pipeline.py run --data-dir dataset_aug --work-dir work_v4 --folds 4` at commit `efea6b7`; the chosen candidate does not use its scores.)
 
 On a 12-core / 24 GB laptop each full run takes about 3 hours (training about 1.5 h, test prediction about 1.5 h).
 
@@ -93,6 +93,7 @@ python code/business_entity_resolution/src/error_analysis.py --work-dir work --n
 Prints false merges and missed matches from the out-of-fold predictions, broken down by country and error type.
 
 ## Validate and package
+`utils/validate_submission.py` is the organisers' validator from the official challenge kit (`student_resource/utils/`); copy it into `utils/` first.
 ```bash
 python3 utils/validate_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir dataset/test
 bash code/business_entity_resolution/make_submission.sh <team_name>
