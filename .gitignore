@@ -18,3 +18,4 @@ output/
 work/
 output_v*/
 output_diag/
+sagemaker_upload/
