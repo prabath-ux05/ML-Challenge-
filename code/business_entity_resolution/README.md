@@ -63,7 +63,7 @@ Test decoys come in *groups* of 2–3 records at one slightly shifted house numb
 
 Diagnostics: `src/shift_report.py` (score profiles, train OOF vs test) and `src/entity_mix.py` (entity-mix re-weighting).
 
-## Reproducing the final submission (public LB 0.9706)
+## Reproducing the final submission (public LB 0.971928)
 The final `output/` is the average of two runs, with the decision re-tuned on held-out training entities:
 1. **v3.1** (original data), code at commit `2e476ba`:
    `git checkout 2e476ba -- code/` then `python code/business_entity_resolution/src/pipeline.py run --data-dir dataset --work-dir work --out-dir output_v31`, then `git checkout main -- code/`.
@@ -75,7 +75,12 @@ The final `output/` is the average of two runs, with the decision re-tuned on he
 3. **Average and decide:**
    ```bash
    python code/business_entity_resolution/src/blend_oof.py eval  --works work work_v4 work_v5 --sample-seeds 7 7 11 --spec 'work+work_v5'
-   python code/business_entity_resolution/src/blend_oof.py apply --works work work_v4 work_v5 --candidate 'work+work_v5' --out-dir output
+   python code/business_entity_resolution/src/blend_oof.py apply --works work work_v4 work_v5 --candidate 'work+work_v5' --out-dir output_final
+   ```
+4. **France decision** (France has no training labels; its probabilities are scaled by 0.70 before the decision, US/India rows unchanged):
+   ```bash
+   python code/business_entity_resolution/src/country_adjust.py --works work work_v4 work_v5 --candidate 'work+work_v5' --country france --factors 0.7 --out-prefix output_fr
+   cp output_fr_0.70/*.tsv output/
    ```
    (`work_v4` is only a placeholder in `--works`: `pipeline.py run --data-dir dataset_aug --work-dir work_v4 --folds 4` at commit `a320aa0`; the chosen candidate does not use its scores.)
 
