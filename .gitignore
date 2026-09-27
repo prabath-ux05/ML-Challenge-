@@ -21,3 +21,7 @@ output_diag/
 sagemaker_upload/
 dataset_aug/
 work_*/
+
+# generated submissions / probes (large)
+output_*/
+*.tsv
