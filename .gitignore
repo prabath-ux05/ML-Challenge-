@@ -19,3 +19,5 @@ work/
 output_v*/
 output_diag/
 sagemaker_upload/
+dataset_aug/
+work_*/

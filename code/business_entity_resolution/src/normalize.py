@@ -94,8 +94,9 @@ LEGAL_TOKENS = {
     "du", "des", "l", "d", "et", "soc", "assn",
     # honorifics / prefixes seen in the data ("M/s ABC Traders", "Mr RKK Products", "Sri ...")
     "ms", "mr", "mrs", "sri", "shri", "shree", "smt", "null",
-    # generic French suffix noise ("Pole (France) Societe", "SARL Adn Anciens")
-    "france",
+    # NB: "france" is deliberately NOT a legal token. Test decoys add a bare "France" to a real
+    # business name ("Villa Usep Club France SARL", next door): only 7% of such look-alikes share
+    # the entity's house number vs 82% of the others. Stripping it hid the decoy's changed word.
 }
 
 # Multi-word phrases collapsed before tokenising.

@@ -1,8 +1,8 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
 **Team Name:** Mesh Minds
-**Team Members:** TODO (list all team members)
-**Submission Date:** TODO
+**Team Members:** Prabath D, Syed Amrullah, R Sai Padmini, Vamsi Tarun A (Vel Tech)
+**Submission Date:** 27 September 2026
 
 ---
 
@@ -111,9 +111,10 @@ The approach is entirely data-driven. It uses no external data, APIs or pretrain
   - sibling evidence from expansion
 
 **Model type:**
-- scikit-learn `HistGradientBoostingClassifier` (BSD-3), in 2 stages × 4 folds.
+- **LightGBM** (MIT licence; about 1,000–1,300 trees of 127 leaves per stage-1 fold model), in 2 stages × 4 folds. scikit-learn's `HistGradientBoostingClassifier` (BSD-3) is only a fallback when LightGBM's OpenMP runtime is missing.
 - Folds are grouped by Source 1 entity, and every training pair gets an out-of-fold score.
-- Models are fit on 25% of entities, with negatives down-sampled to 35% and re-weighted. Test scores average the fold models.
+- Models are fit on 30% of entities, keeping every positive, every hard negative (name or address similarity ≥ 80) and 25% of the easy negatives, re-weighted. Test scores average the fold models.
+- An entity-level LightGBM "has any match" model, fit out-of-fold on each entity's score profile, feeds the probability of the empty prediction.
 
 **Threshold selection method:**
 - Grid search on held-out entities (never used for fitting) with the exact macro-F0.5 metric, including singletons.
@@ -124,8 +125,6 @@ The approach is entirely data-driven. It uses no external data, APIs or pretrain
 
 ## 5. Results & Error Analysis
 
-| run | blocking recall | oracle F0.5 | stage-1 F0.5 | stage-2 F0.5 |
-|---|---|---|---|---|
 All F0.5 values are out-of-fold macro-F0.5 on held-out Source 1 entities, singletons included.
 
 | run | candidate recall | oracle F0.5 | stage-1 F0.5 | stage-2 F0.5 | public LB |
@@ -159,11 +158,19 @@ v3.1 adds:
 
 This breakdown drove the v3.1 priorities. Expansion targets blocking misses; the singleton model and segment thresholds target singletons.
 
-**Leaderboard vs validation.**
-- v2 scored 0.952 on the public leaderboard against 0.9706 validation.
-- US and India are validated. France (15% of test) has no training labels, so we attribute most of the gap to France.
-- We found systematic French normalisation mismatches: region vs department names, `N°`, and French noise words. These were fixed in v3.1.
-- The hypothesis that orphan records cause false merges was tested (by dropping Source 1 entities from train) and rejected.
+**Leaderboard vs validation: the train→test shift.**
+- v2 scored 0.952 on the public leaderboard against 0.9706 validation, so we measured how test differs from train, using only model-free statistics of the candidate pairs.
+- Test has 5.5–5.8 Source 2/3 records per Source 1 entity in every country, against a uniform 4.68 in train. The *clean* copies are unchanged: exact name+address duplicates per entity are 0.581 (US) and 0.240 (India) in both splits, and same-number near-duplicates are also unchanged. The extra records are therefore decoys, not extra true copies.
+- **Decoys in test come in groups.** Several records share one slightly shifted house number next to the real business (`… Banco Lakeside Inc | 4889 Bentbrook Dr`, `… Banco Co | 4889 …` beside the real `4882`). In train, 79% of shifted-number look-alikes stood alone, and a *group* of look-alikes at a shifted number meant true copies (US P(true) 0.68 for 2 records, 0.975 for 3+), for example when the Source 1 record itself carried a truncated number. In test, such groups are about 6× more frequent per US entity. So the model learned a signal that test turns against it.
+- Re-weighting train entities to the test mix (by near-duplicate, decoy and candidate counts) left v2's validation unchanged (0.967), which confirms that the shift is inside the entity, not in the entity mix.
+- **France:** decoys often append a bare word `France` to the real name. Only 7% of such look-alikes share the entity's house number, against 82% of the others. Our normaliser had treated `France` as a noise token and deleted it, which hid the decoy's changed word; v3.2 keeps it.
+- The orphan-record hypothesis was tested (by dropping Source 1 entities from train) and rejected.
+
+**Test-time prior correction (`src/recalibrate.py`).**
+- Each candidate pair is assigned a segment from its entity's look-alikes (name ≥ 70, address ≥ 85): country × {same house number | shifted number with a group of 1, 2 or 3+ records} × {the entity also has a same-number look-alike}.
+- Within every segment the model is well calibrated on train (mean OOF p = true rate to within 0.03), so a label-shift correction applies: each pair's odds are multiplied by odds(π_test)/odds(π_train) for its segment.
+- π_test is estimated in two independent ways: by counting (true pairs per entity in each segment as in train, divided by test pairs per entity) and by EM on the model's own test scores (Saerens et al., 2002). For example, US "2 records at a shifted number, entity also has a same-number copy": 0.06 → 0.67 pairs per entity, P(true) 0.968 in train and an estimated LB_TODO_RECAL in test.
+- The corrected probabilities then go through the same tuned expected-F0.5 decision and singleton model.
 
 **Common false positives (wrong merges):**
 - near-copies of a business with a slightly shifted house number (`3376` vs `3380`) or one swapped name word (`Jain Services` vs `Jain Infra`)

@@ -27,7 +27,7 @@ python code/business_entity_resolution/src/pipeline.py run \
 1. Normalises all records into `work/norm/*.parquet` using parallel workers. This is cached.
 2. Generates candidates with key blocking into `work/train_cand.parquet`. The log reports blocking recall and the oracle macro-F0.5 given those candidates.
 3. Computes pair features for every candidate into `work/train_feat_v*/`.
-4. Trains in 4 folds (GroupKFold by Source 1 entity). Models are fit on a sample of Source 1 entities: `--sample 0.25`, keeping all positives and `--neg-keep 0.35` of negatives, re-weighted. Each fold model then scores every candidate pair out-of-fold, for stage 1 and stage 2.
+4. Trains LightGBM in K folds grouped by Source 1 entity (`--folds`, stratified by country × has-match). Models are fit on a sample of Source 1 entities (`--sample 0.3`), keeping all positives, all hard negatives and `--neg-keep 0.25` of easy negatives, re-weighted. Each fold model then scores every candidate pair out-of-fold, for stage 1 and stage 2.
 5. Tunes the decision rule on held-out entities, then saves `work/model.joblib`, `work/cv_report.json` and `work/train_oof.parquet`.
 
 ### Prediction
@@ -47,6 +47,21 @@ Approximate runtimes on an M-series laptop:
 | features (train) | ~15–20 min |
 | training | ~40–60 min |
 | predict | ~25 min |
+
+## Test-set shift: decoy groups (read this before reproducing the final submission)
+Test decoys come in *groups* of 2–3 records at one slightly shifted house number next to the real business, about 6× more often per entity than in train, where such groups were mostly true copies. Two remedies, both label-free on the test side:
+
+1. **Synthetic decoy groups for training** (`src/augment_decoys.py`). Copies a share of each training entity's own Source 2/3 records to a shifted house number, optionally adding or swapping one word from a vocabulary mined from train's own decoys, and appends them to the training sources as unlinked records (ground truth unchanged):
+   ```bash
+   python code/business_entity_resolution/src/augment_decoys.py --data-dir dataset --out-dir dataset_aug
+   python code/business_entity_resolution/src/pipeline.py run --data-dir dataset_aug --work-dir work_v4 --out-dir output_v4 --folds 4
+   ```
+2. **Test-time prior correction** (`src/recalibrate.py`). Re-estimates P(true) per look-alike segment on test (count-based and EM) and shifts each pair's odds before the same decision rule:
+   ```bash
+   python code/business_entity_resolution/src/recalibrate.py --work-dir work --out-dir output_recal --method count
+   ```
+
+Diagnostics: `src/shift_report.py` (score profiles, train OOF vs test) and `src/entity_mix.py` (entity-mix re-weighting).
 
 ## Error analysis
 ```bash
@@ -78,6 +93,9 @@ python code/business_entity_resolution/src/evaluate.py --pred /tmp/o/matching_re
 | `src/pipeline.py` | Orchestration: CV training, OOF scoring, vectorised F0.5 metric and decision tuning, prediction, output writing |
 | `src/error_analysis.py` | False merges and misses from the out-of-fold predictions |
 | `src/evaluate.py` | Macro-F0.5 scorer for a `matching_results.tsv` |
+| `src/augment_decoys.py` | Synthetic decoy groups appended to the training sources (domain adaptation to the test decoy pattern) |
+| `src/recalibrate.py` | Test-time label-shift correction per look-alike segment, then the tuned decision |
+| `src/shift_report.py`, `src/entity_mix.py` | Train-vs-test shift diagnostics |
 
 ## Compliance
-No external data, APIs, geocoders or pretrained models are used. The only models are scikit-learn `HistGradientBoostingClassifier` (BSD-3), trained from scratch on the provided training data. TF-style token statistics are computed on each split's own records, without labels.
+No external data, APIs, geocoders or pretrained models are used. The models are LightGBM (MIT), trained from scratch on the provided training data; scikit-learn's `HistGradientBoostingClassifier` (BSD-3) is only a fallback. Token statistics are computed on each split's own records, without labels. The decoy vocabulary for augmentation is mined from train only.

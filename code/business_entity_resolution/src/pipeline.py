@@ -596,6 +596,8 @@ def cmd_predict(a):
     # always keep test scores: re-tuning decisions / diagnostics never need a re-run
     pl.concat([cand_u, seg_u], how="horizontal").with_columns(p1=pl.Series(p1_u), p=pl.Series(p)) \
         .write_parquet(os.path.join(work, "test_scores.parquet"))
+    if has_match is not None:
+        has_match.write_parquet(os.path.join(work, "test_has_match.parquet"))
     matched = pred["i"].n_unique()
     log(f"wrote {a.out_dir}: {matched}/{s1.height} S1 with matches, {pred.height} links")
     for c in sorted(s1["country"].unique()):
