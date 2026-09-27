@@ -63,6 +63,24 @@ Test decoys come in *groups* of 2–3 records at one slightly shifted house numb
 
 Diagnostics: `src/shift_report.py` (score profiles, train OOF vs test) and `src/entity_mix.py` (entity-mix re-weighting).
 
+## Reproducing the final submission (public LB 0.9706)
+The final `output/` is the average of two runs, with the decision re-tuned on held-out training entities:
+1. **v3.1** (original data), code at commit `2e476ba`:
+   `git checkout 2e476ba -- code/` then `python code/business_entity_resolution/src/pipeline.py run --data-dir dataset --work-dir work --out-dir output_v31`, then `git checkout main -- code/`.
+2. **v5** (synthetic decoy groups, current code):
+   ```bash
+   python code/business_entity_resolution/src/augment_decoys.py --data-dir dataset --out-dir dataset_aug
+   python code/business_entity_resolution/src/pipeline.py run --data-dir dataset_aug --work-dir work_v5 --out-dir output_v5 --folds 4 --block-cfg '{"max_per_s1":36}' --sample-seed 11
+   ```
+3. **Average and decide:**
+   ```bash
+   python code/business_entity_resolution/src/blend_oof.py eval  --works work work_v4 work_v5 --sample-seeds 7 7 11 --spec 'work+work_v5'
+   python code/business_entity_resolution/src/blend_oof.py apply --works work work_v4 work_v5 --candidate 'work+work_v5' --out-dir output
+   ```
+   (`work_v4` is only a placeholder in `--works`: `pipeline.py run --data-dir dataset_aug --work-dir work_v4 --folds 4` at commit `a320aa0`; the chosen candidate does not use its scores.)
+
+On a 12-core / 24 GB laptop each full run takes about 3 hours (training about 1.5 h, test prediction about 1.5 h).
+
 ## Error analysis
 ```bash
 python code/business_entity_resolution/src/error_analysis.py --work-dir work --n 30

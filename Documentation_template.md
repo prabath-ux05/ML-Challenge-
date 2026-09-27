@@ -78,7 +78,7 @@ The approach is entirely data-driven. It uses no external data, APIs or pretrain
   - For each confident stage-1 match (i, u), targets sharing a small block (≤30 records) with u are collected.
   - A target t is kept when it is a near-duplicate of u: name or address token-set similarity ≥ 85.
   - (i, t) is added with sibling-evidence features, up to 10 per entity.
-- **Candidate pairs generated:** train 62.2M from blocking + 9.8M from expansion = 72.0M (about 32.6 per Source 1 entity, versus 2.2M × 10.3M ≈ 2.3×10^13 possible pairs, a reduction of more than 99.9999%); test: TODO
+- **Candidate pairs generated:** train 62.2M from blocking + 9.8M from expansion = 72.0M (about 32.6 per Source 1 entity, versus 2.2M × 10.3M ≈ 2.3×10^13 possible pairs, a reduction of more than 99.9999%); test (final submission, union of the v3.1 and v5 candidate sets): **68.25M pairs, 39.4 per Source 1 entity**
 - **How we ensured true matches were not lost:**
   - We measured blocking recall and the oracle macro-F0.5 on train at every iteration.
   - Recall went from 90.6% (single keys) to 95.7% (cross-rank keys), then 96.2% (skeleton keys and state transliteration), then 96.3% (zero-padded numbers), then **97.6% with cluster expansion** (oracle F0.5 0.9898).
@@ -131,7 +131,12 @@ All F0.5 values are out-of-fold macro-F0.5 on held-out Source 1 entities, single
 |---|---|---|---|---|---|
 | baseline (single-rank keys, sklearn HGB, 10% sample) | 95.7% | 0.9838 | 0.9604 | 0.9629 | — |
 | v2 (cross-rank + skeleton keys, state transliteration, IDF and coherence features, 25% sample) | 96.2% | 0.9861 | 0.9677 | 0.9706 | 0.952 |
-| v3.1 (see below) | **97.6%** | **0.9898** | **0.9752** | **0.9778** | **0.967** |
+| v3.1 (see below) | 97.6% | 0.9898 | 0.9752 | 0.9778 | 0.967 |
+| v4: trained with synthetic decoy groups + France fix (augmented train*) | 97.5% | 0.9896 | 0.9702 | 0.9739 | 0.968 |
+| v5: v4 + specific blocking keys + number-agreement/source context (augmented train*) | **97.8%** | **0.9908** | 0.9707 | **0.9766** | **0.971** |
+| **final: average of v3.1 and v5** (decision re-tuned on held-out entities) | — | — | — | 0.9781 (held-out) | **0.9706** |
+
+\* v4/v5 are scored on the decoy-augmented train (1.1M extra hard negatives), a harder set than v3.1's.
 
 v3.1 adds:
 - cluster expansion (recall 96.3% → 97.6%)
@@ -140,6 +145,10 @@ v3.1 adds:
 - French region/department normalisation
 - LightGBM on 30% of entities with hard-negative sampling
 - the singleton model and segment-specific thresholds
+
+**v4 and v5 (trained for the test decoy pattern):**
+- **v4** trains on `dataset_aug`: the original training data plus **1.10M synthetic decoy records in 571k groups** (`src/augment_decoys.py`). Each group copies 1–3 of an entity's own Source 2/3 records to a house number shifted by 1–15, optionally adding or swapping one word from a vocabulary mined from train's own decoys ("Lakeside", "Partners", "Exports", "India"), to 35% of US and 15% of Indian entities (including singletons). v4 also keeps `France` in names. Out-of-fold macro-F0.5 on the *augmented* train: 0.9739 (US 0.9809, India 0.9625, singletons 0.9749), with 1.1M extra hard negatives present.
+- **v5** adds three specific blocking keys (rare address-token pair × house number, rare name-token pair × house number, name-token pair × address token). In train, 46% of India's blocking misses shared a key whose block exceeded the caps; the new keys recover about 15k missed matches. v5 also adds stage-2 context features: **house-number agreement** with the entity's confident matches (real copies share the majority number, decoy groups a minority one) and **same-source / other-source context** (80% of entities have copies in both Source 2 and Source 3). It keeps up to 36 candidates per entity and fits on a different 30% entity sample from v4.
 
 **Per slice:**
 
@@ -166,10 +175,11 @@ This breakdown drove the v3.1 priorities. Expansion targets blocking misses; the
 - **France:** decoys often append a bare word `France` to the real name. Only 7% of such look-alikes share the entity's house number, against 82% of the others. Our normaliser had treated `France` as a noise token and deleted it, which hid the decoy's changed word; v3.2 keeps it.
 - The orphan-record hypothesis was tested (by dropping Source 1 entities from train) and rejected.
 
-**Test-time prior correction (`src/recalibrate.py`).**
+**Test-time prior correction (`src/recalibrate.py`), evaluated and rejected.**
 - Each candidate pair is assigned a segment from its entity's look-alikes (name ≥ 70, address ≥ 85): country × {same house number | shifted number with a group of 1, 2 or 3+ records} × {the entity also has a same-number look-alike}.
 - Within every segment the model is well calibrated on train (mean OOF p = true rate to within 0.03), so a label-shift correction applies: each pair's odds are multiplied by odds(π_test)/odds(π_train) for its segment.
-- π_test is estimated in two independent ways: by counting (true pairs per entity in each segment as in train, divided by test pairs per entity) and by EM on the model's own test scores (Saerens et al., 2002). For example, US "2 records at a shifted number, entity also has a same-number copy": 0.06 → 0.67 pairs per entity, P(true) 0.968 in train and an estimated LB_TODO_RECAL in test.
+- π_test is estimated in two independent ways: by counting (true pairs per entity in each segment as in train, divided by test pairs per entity) and by EM on the model's own test scores (Saerens et al., 2002). For example, US "2 records at a shifted number, entity also has a same-number copy": 0.06 → 0.67 pairs per entity, P(true) 0.968 in train and an estimated 0.087 (count) / 0.057 (EM) in test.
+- **Outcome: not used.** On test, the model's *mean* probability in that segment was already 0.107 (0.934 in train): other features give the test decoys away, so the label-shift premise (unchanged P(x|y)) did not hold and the full correction would have erased true matches. We addressed the shift by *training* on synthetic decoy groups instead (v4/v5).
 - The corrected probabilities then go through the same tuned expected-F0.5 decision and singleton model.
 
 **Common false positives (wrong merges):**
@@ -186,7 +196,17 @@ This breakdown drove the v3.1 priorities. Expansion targets blocking misses; the
 ---
 
 ## 6. Conclusion
-TODO
+Our final submission averages two LightGBM pipelines: v3.1, trained on the original data, and v5, trained on data augmented with synthetic decoy groups and using specific combined blocking keys and house-number-agreement context. Public leaderboard: 0.952 (v2) → 0.967 (v3.1) → 0.968 (v4) → 0.971 (v5, v3.1 + v5).
+
+What made the difference:
+- **Measuring the train→test shift instead of guessing.** Model-free statistics showed that clean copies are unchanged in test while decoys come in groups at a shifted house number, about 6× more often per entity. That explained why validation (0.978) overstated the leaderboard, and led to the synthetic decoy groups.
+- **A label-free test for decoy words** (how often a name change keeps the real house number) exposed a French normalisation bug (`France` stripped as noise although decoys add it) and showed which French words mark decoys.
+- **Recall work driven by miss analysis:** 46% of India's blocking misses shared a key whose block was too large, so we added more specific combined keys (+0.26 points recall, +0.5 India F0.5).
+- **A calibrated simulation engine:** held-out out-of-fold F0.5 anchored to one known leaderboard score predicted v5's leaderboard score exactly (0.971) and let us rank blends without spending submissions.
+
+Limitations and next steps:
+- Remaining errors are spread across genuinely ambiguous cases: address-less records with common names (63k train matches never become candidates), Indian-script names without a Latin counterpart, and French chains. France has no labels, and its estimated score is the weakest.
+- With more time: group-level (cluster) matching of all Source 2/3 records before assignment, embedding- or character-n-gram nearest-neighbour blocking for the address-less and cross-script cases, and fitting on 100% of entities.
 
 ---
 
@@ -210,4 +230,29 @@ python code/business_entity_resolution/src/pipeline.py run --data-dir dataset --
 This writes `output/matching_results.tsv` and `output/candidate_pairs.tsv`. See the README for runtimes and flags.
 
 ### B. Additional Results
-TODO
+**Simulation of final-submission options** (held-out out-of-fold macro-F0.5 on 300k entities never used for fitting; "test-like" = with the synthetic decoys, "original" = without them; the simulated leaderboard is anchored on v4's real 0.968):
+
+| option | test-like | original | simulated LB | actual LB |
+|---|---|---|---|---|
+| v4 | 0.9735 | 0.9754 | 0.968 (anchor) | 0.968 |
+| v5 | 0.9766 | 0.9778 | ≈ 0.971 | **0.971** |
+| v4 + v5 | 0.9767 | 0.9780 | ≈ 0.971 | — |
+| v4 + 2×v5 | 0.9770 | 0.9782 | ≈ 0.9715 | — |
+| **v3.1 + v5** | 0.9781 | 0.9794 | ≈ 0.9725 | **0.9706** |
+| v3.1 + v4 + v5 | 0.9777 | 0.9789 | ≈ 0.972 | — |
+
+Options containing v3.1 are optimistic in the test-like world, because v3.1 never scored the synthetic decoys on train; the leaderboard confirmed this (0.9706 vs the simulated ≈ 0.9725).
+
+**Reproducing the final submission:**
+```
+# v3.1: original data, code at commit 2e476ba
+git checkout 2e476ba -- code/ && python code/business_entity_resolution/src/pipeline.py run --data-dir dataset --work-dir work --out-dir output_v31
+git checkout main -- code/
+# v5: synthetic decoy groups + current code
+python code/business_entity_resolution/src/augment_decoys.py --data-dir dataset --out-dir dataset_aug
+python code/business_entity_resolution/src/pipeline.py run --data-dir dataset_aug --work-dir work_v5 --out-dir output_v5 --folds 4 --block-cfg '{"max_per_s1":36}' --sample-seed 11
+# average, decision re-tuned on held-out entities, write output/
+python code/business_entity_resolution/src/blend_oof.py eval --works work work_v4 work_v5 --sample-seeds 7 7 11 --spec 'work+work_v5'
+python code/business_entity_resolution/src/blend_oof.py apply --works work work_v4 work_v5 --candidate 'work+work_v5' --out-dir output
+```
+(`work_v4` is only needed as a placeholder in `--works`; its scores are not used by the chosen candidate.)
