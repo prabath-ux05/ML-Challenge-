@@ -78,10 +78,10 @@ The approach is entirely data-driven. It uses no external data, APIs or pretrain
   - For each confident stage-1 match (i, u), targets sharing a small block (≤30 records) with u are collected.
   - A target t is kept when it is a near-duplicate of u: name or address token-set similarity ≥ 85.
   - (i, t) is added with sibling-evidence features, up to 10 per entity.
-- **Candidate pairs generated:** TODO train / TODO test
+- **Candidate pairs generated:** train 62.2M from blocking + 9.8M from expansion = 72.0M (about 32.6 per Source 1 entity, versus 2.2M × 10.3M ≈ 2.3×10^13 possible pairs, a reduction of more than 99.9999%); test: TODO
 - **How we ensured true matches were not lost:**
   - We measured blocking recall and the oracle macro-F0.5 on train at every iteration.
-  - Recall went from 90.6% (single keys) to 95.7% (cross-rank keys), then 96.2% (skeleton keys and state transliteration), then TODO with expansion.
+  - Recall went from 90.6% (single keys) to 95.7% (cross-rank keys), then 96.2% (skeleton keys and state transliteration), then 96.3% (zero-padded numbers), then **97.6% with cluster expansion** (oracle F0.5 0.9898).
   - Each miss category (native script, no address, shortened address) was analysed and targeted.
 
 ---
@@ -126,16 +126,55 @@ The approach is entirely data-driven. It uses no external data, APIs or pretrain
 
 | run | blocking recall | oracle F0.5 | stage-1 F0.5 | stage-2 F0.5 |
 |---|---|---|---|---|
-| baseline (single-rank keys, 10% sample) | 95.7% | 0.9838 | 0.9604 | **0.9629** |
-| v2 (skeleton keys, state transliteration, IDF and coherence features, 25% sample) | 96.2% | 0.9861 | TODO | TODO |
-| v3 (+ cluster expansion) | TODO | TODO | TODO | TODO |
+All F0.5 values are out-of-fold macro-F0.5 on held-out Source 1 entities, singletons included.
 
-- Baseline by country: US 0.9769, India 0.9415; singletons 0.9527.
-- **Common false positives (wrong merges):** TODO from `error_analysis.py`
-- **Common false negatives (missed matches):**
-  - native-script names with shortened addresses
-  - address-less records with typo'd names
-  - pseudonymous trade names whose address was also altered
+| run | candidate recall | oracle F0.5 | stage-1 F0.5 | stage-2 F0.5 | public LB |
+|---|---|---|---|---|---|
+| baseline (single-rank keys, sklearn HGB, 10% sample) | 95.7% | 0.9838 | 0.9604 | 0.9629 | — |
+| v2 (cross-rank + skeleton keys, state transliteration, IDF and coherence features, 25% sample) | 96.2% | 0.9861 | 0.9677 | 0.9706 | 0.952 |
+| v3.1 (see below) | **97.6%** | **0.9898** | **0.9752** | **0.9778** | TODO |
+
+v3.1 adds:
+- cluster expansion (recall 96.3% → 97.6%)
+- the zero-padded number fix and number-distance features
+- consonant-skeleton similarity
+- French region/department normalisation
+- LightGBM on 30% of entities with hard-negative sampling
+- the singleton model and segment-specific thresholds
+
+**Per slice:**
+
+| slice | baseline | v2 | v3.1 |
+|---|---|---|---|
+| US | 0.9769 | 0.9803 | **0.9850** |
+| India | 0.9415 | 0.9555 | **0.9667** |
+| singletons | 0.9527 | 0.9593 | **0.9779** |
+
+**Loss attribution for v2** (F0.5 points lost, out of 2.96 in total):
+- blocking misses: 1.28
+- model misses: 0.76
+- false merges: 0.32
+- singletons wrongly matched: 0.23
+- mixed: 0.38
+
+This breakdown drove the v3.1 priorities. Expansion targets blocking misses; the singleton model and segment thresholds target singletons.
+
+**Leaderboard vs validation.**
+- v2 scored 0.952 on the public leaderboard against 0.9706 validation.
+- US and India are validated. France (15% of test) has no training labels, so we attribute most of the gap to France.
+- We found systematic French normalisation mismatches: region vs department names, `N°`, and French noise words. These were fixed in v3.1.
+- The hypothesis that orphan records cause false merges was tested (by dropping Source 1 entities from train) and rejected.
+
+**Common false positives (wrong merges):**
+- near-copies of a business with a slightly shifted house number (`3376` vs `3380`) or one swapped name word (`Jain Services` vs `Jain Infra`)
+- native-script names at the same address as a different English-named business
+- address-less records with common names assigned to the wrong same-name entity
+
+**Common false negatives (missed matches):**
+- native-script names with shortened addresses
+- address-less records with typo'd names
+- pseudonymous trade names whose address was also altered
+- about a third of model misses are records lost to a competing entity under the one-to-one rule, mostly address-less records with common names, which are inherently ambiguous
 
 ---
 
