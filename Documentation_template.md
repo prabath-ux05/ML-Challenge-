@@ -131,7 +131,7 @@ All F0.5 values are out-of-fold macro-F0.5 on held-out Source 1 entities, single
 |---|---|---|---|---|---|
 | baseline (single-rank keys, sklearn HGB, 10% sample) | 95.7% | 0.9838 | 0.9604 | 0.9629 | — |
 | v2 (cross-rank + skeleton keys, state transliteration, IDF and coherence features, 25% sample) | 96.2% | 0.9861 | 0.9677 | 0.9706 | 0.952 |
-| v3.1 (see below) | **97.6%** | **0.9898** | **0.9752** | **0.9778** | TODO |
+| v3.1 (see below) | **97.6%** | **0.9898** | **0.9752** | **0.9778** | **0.967** |
 
 v3.1 adds:
 - cluster expansion (recall 96.3% → 97.6%)

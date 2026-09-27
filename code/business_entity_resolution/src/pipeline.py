@@ -26,7 +26,7 @@ from blocking import DEFAULT_BLOCKING, blocking_recall, generate_candidates  # n
 from features import (GROUP_BASE, context_features, group_features, name_frequencies,  # noqa: E402
                       pair_features, token_idf)
 
-FEATURE_VERSION = 4  # bump when pair/group features change, so cached parts are rebuilt
+FEATURE_VERSION = 5  # bump when pair/group features change, so cached parts are rebuilt
 from expand import DEFAULT_EXPANSION, expansion_candidates  # noqa: E402
 from models import HAVE_LGB, LGBModel, _Booster, lgb  # noqa: E402,F401  (_Booster: unpickling old models)
 from prep import load_split  # noqa: E402
@@ -459,7 +459,7 @@ def cmd_train(a):
     parts, gpath = feature_parts("train", s1, tg, cand, work)
     log("features ready")
 
-    h = s1.select(pl.col("id").hash(seed=7)).to_series().to_numpy()
+    h = s1.select(pl.col("id").hash(seed=a.sample_seed)).to_series().to_numpy()
     fold_s1 = stratified_group_folds(s1, truth, a.folds)
     fit_ok = np.ones(s1.height, bool)
     if a.fit_countries:  # unseen-country proxy: fit only on these countries, score everything OOF
@@ -618,6 +618,7 @@ def main():
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--sample", type=float, default=0.3, help="fraction of S1 entities used to fit models")
     ap.add_argument("--neg-keep", type=float, default=0.25, help="share of easy negative pairs kept for fitting")
+    ap.add_argument("--sample-seed", type=int, default=7, help="which entities form the fitting sample")
     ap.add_argument("--eval-s1", type=int, default=300_000, help="held-out S1 used to tune the decision")
     ap.add_argument("--s1-frac", type=float, default=1.0, help="fast experiments: use this share of train S1")
     ap.add_argument("--fit-countries", type=lambda x: [c.strip().lower() for c in x.split(",")], default=None,

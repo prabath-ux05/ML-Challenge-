@@ -54,6 +54,11 @@ def _key_exprs():
     no_addr = (pl.col("addr_core").str.len_chars() < 3) | (pl.col("side") == 0)
     skel = pl.when(pl.col("name_core") != "").then(_skeleton(pl.col("name_core")))
     one = lambda e: pl.concat_list([e]).list.drop_nulls()  # noqa: E731
+
+    def pair_exprs(xs):  # order-independent token pairs, one expression each
+        return [pl.when(xs[a].is_not_null() & xs[b].is_not_null())
+                .then(pl.min_horizontal(xs[a], xs[b]) + " " + pl.max_horizontal(xs[a], xs[b]))
+                for a in range(len(xs)) for b in range(a + 1, len(xs))]
     return {
         "core": (one(core), 30, 300),
         "ph": (one(ph), 30, 300),
@@ -74,6 +79,11 @@ def _key_exprs():
         "skel": (one(skel), 15, 150),
         "skel_num": (one(skel + "#" + num), 15, 150),
         "skel_a": (_combos([skel], at[:2], "@"), 15, 150),
+        # more specific combinations for records whose single-token keys fall in oversized blocks
+        # (India: 46% of blocking misses share a key whose block exceeds the caps)
+        "aanum": (_combos(pair_exprs(at), [num], "#"), 15, 150),
+        "nnnum": (_combos(pair_exprs(nt), [num], "#"), 15, 150),
+        "nn_a": (_combos(pair_exprs(nt), at[:2], "@"), 15, 150),
     }
 
 
