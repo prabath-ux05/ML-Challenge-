@@ -254,6 +254,19 @@ def context_features(ij: pl.DataFrame, p: np.ndarray, tg: pl.DataFrame, top=3, m
         p_n50_s1=(pl.col("p") > 0.5).sum().over("i"),
         p_n50_tg=(pl.col("p") > 0.5).sum().over("j"),
     )
+    # per-source context: most entities have copies in BOTH Source 2 and Source 3 (80% in train),
+    # so "no confident match yet in the other source" raises the odds of this pair
+    src = tg["id"].str.starts_with("S3").gather(g["j"]).cast(pl.Int8)
+    gs = g.with_columns(src=src)
+    A = gs.group_by("i", "src").agg(mx=pl.col("p").max(), n50=(pl.col("p") > 0.5).sum())
+    S = (gs.select("i", "src").with_row_index("r")
+         .join(A, on=["i", "src"], how="left")
+         .join(A.rename({"mx": "mx_o", "n50": "n50_o"}).with_columns(src=(1 - pl.col("src")).cast(pl.Int8)),
+               on=["i", "src"], how="left")
+         .sort("r")
+         .select(p_max_same_src=pl.col("mx"), p_n50_same_src=pl.col("n50"),
+                 p_max_other_src=pl.col("mx_o").fill_null(0.0), p_n50_other_src=pl.col("n50_o").fill_null(0)))
+    C = pl.concat([C, S], how="horizontal")
 
     # coherence (only for pairs with non-negligible p; others stay null)
     g = g.with_row_index("r")
@@ -279,5 +292,24 @@ def context_features(ij: pl.DataFrame, p: np.ndarray, tg: pl.DataFrame, top=3, m
     coh = pl.concat(res) if res else pl.DataFrame(schema={"r": pl.UInt32, "coh_n": pl.Float32, "coh_a": pl.Float32,
                                                          "coh_sim_n": pl.Float32, "coh_sim_a": pl.Float32})
     coh = g.select("r").join(coh, on="r", how="left", maintain_order="left").drop("r")
-    out = pl.concat([C, gi, gj, coh], how="horizontal")
+
+    # house-number agreement with the entity's confident matches: real copies share the number used
+    # by most of the entity's other copies; decoy groups sit at a (shared) minority number
+    fnum = tg["first_num"]
+    Cf = g.filter(pl.col("p") >= 0.5).sort("p", descending=True).group_by("i").head(8).select("i", u="j", pu="p")
+    Cf = Cf.with_columns(nu=fnum.gather(Cf["u"])).filter(pl.col("nu") != "")
+    res = []
+    for s in range(0, rows.height, chunk):
+        q = rows.slice(s, chunk)
+        q = q.with_columns(nj=fnum.gather(q["j"])).filter(pl.col("nj") != "")
+        q = q.join(Cf, on="i").filter(pl.col("j") != pl.col("u"))
+        if q.height == 0:
+            continue
+        res.append(q.group_by("r").agg(num_agree=(pl.col("pu") * (pl.col("nu") == pl.col("nj"))).sum(),
+                                       num_disagree=(pl.col("pu") * (pl.col("nu") != pl.col("nj"))).sum()))
+    na = pl.concat(res) if res else pl.DataFrame(schema={"r": pl.UInt32, "num_agree": pl.Float32,
+                                                        "num_disagree": pl.Float32})
+    na = (g.select("r").join(na, on="r", how="left", maintain_order="left").drop("r")
+          .with_columns(num_share=pl.col("num_agree") / (pl.col("num_agree") + pl.col("num_disagree"))))
+    out = pl.concat([C, gi, gj, coh, na], how="horizontal")
     return out.cast({c: pl.Float32 for c in out.columns})
