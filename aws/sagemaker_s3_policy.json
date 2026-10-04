@@ -1,0 +1,38 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "SageMakerBucketListAndLocation",
+            "Effect": "Allow",
+            "Action": [
+                "s3:ListBucket",
+                "s3:GetBucketLocation"
+            ],
+            "Resource": "arn:aws:s3:::business-entity-resolution-data-2026"
+        },
+        {
+            "Sid": "SageMakerReadCodeDataAndModels",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::business-entity-resolution-data-2026/code/*",
+                "arn:aws:s3:::business-entity-resolution-data-2026/business-entity-resolution/*",
+                "arn:aws:s3:::business-entity-resolution-data-2026/models/*"
+            ]
+        },
+        {
+            "Sid": "SageMakerWriteSubmissionsOutput",
+            "Effect": "Allow",
+            "Action": [
+                "s3:PutObject",
+                "s3:AbortMultipartUpload"
+            ],
+            "Resource": [
+                "arn:aws:s3:::business-entity-resolution-data-2026/submissions/*",
+                "arn:aws:s3:::business-entity-resolution-data-2026/output/*"
+            ]
+        }
+    ]
+}

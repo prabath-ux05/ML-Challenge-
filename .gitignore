@@ -1,0 +1,57 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Outputs and logs
+output/
+logs/
+*.log
+scratch/
+reports/*.json
+
+# Local data cache and competition files
+data/
+*.tsv
+*.csv
+*.parquet
+*.tar.gz
+*.zip
+candidate_pairs.tsv
+matching_results.tsv
+
+# Credentials, secrets, and AWS environment files
+.env
+.env.*
+*.env
+*credentials*
+*secret*
+*.pem
+*.key
+aws_config*
+
